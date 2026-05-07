@@ -60,6 +60,60 @@ class MLPResNet(nn.Module):
         x = self.fc2(x)  # shape: (batch_size, output_dim)
         return x
 
+
+class TransitionTokenAdapter(nn.Module):
+    """用上下文预测连续 transition soft tokens。
+
+    数据侧只需要在 action block 后插入若干个相同的 placeholder token。
+    forward 时这些 placeholder 的普通 embedding 会被这里预测出的 soft
+    token embedding 替换，因此它们可以作为未来图像 token 的动态条件。
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        token_id: int = 16001,
+        token_count: int = 4,
+        hidden_mult: int = 4,
+    ):
+        super().__init__()
+        self.token_id = int(token_id)
+        self.token_count = int(token_count)
+        inner_dim = int(hidden_size * hidden_mult)
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, inner_dim),
+            nn.SiLU(),
+            nn.Linear(inner_dim, hidden_size),
+        )
+        self.position = nn.Parameter(torch.zeros(max(self.token_count, 1), hidden_size))
+        nn.init.normal_(self.position, std=0.02)
+
+    def forward(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        transition_mask = input_ids == self.token_id
+        if self.token_count <= 0 or not transition_mask.any():
+            return inputs_embeds
+
+        output_embeds = inputs_embeds.clone()
+        batch_size = input_ids.shape[0]
+        for batch_idx in range(batch_size):
+            positions = torch.where(transition_mask[batch_idx])[0]
+            if positions.numel() == 0:
+                continue
+
+            context_end = int(positions[0].item())
+            if context_end > 0:
+                context = inputs_embeds[batch_idx, :context_end].mean(dim=0)
+            else:
+                context = inputs_embeds[batch_idx, positions].mean(dim=0)
+
+            base_token = self.net(context)
+            pos_ids = torch.arange(positions.numel(), device=input_ids.device) % self.position.shape[0]
+            output_embeds[batch_idx, positions] = base_token.unsqueeze(0) + self.position[pos_ids]
+
+        return output_embeds
+
+
 class L1RegressionActionHead(nn.Module):
     """Simple MLP-based action head that generates continuous actions via L1 regression."""
     def __init__(
@@ -309,8 +363,27 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
         # self.action_head = ActionHead(action_dim=self.action_dim, time_horizon=20, hidden_size_factor=0.25, num_encoder_layers=2)
         self.action_dim = config.action_dim
         self.action_head = ActionHead(action_dim=config.action_dim, time_horizon=config.time_horizon, hidden_size_factor=0.25, num_encoder_layers=2)
+        self.transition_token_adapter = TransitionTokenAdapter(
+            hidden_size=config.hidden_size,
+            token_id=config.transition_token_id,
+            token_count=config.transition_token_count,
+            hidden_mult=config.transition_token_hidden_mult,
+        )
         self.post_init()
         
+    def _prepare_transition_inputs(self, input_ids, labels=None):
+        if input_ids is None or self.config.transition_token_count <= 0:
+            return None, labels
+
+        transition_mask = input_ids == self.config.transition_token_id
+        if not transition_mask.any():
+            return None, labels
+
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        inputs_embeds = self.transition_token_adapter(input_ids, inputs_embeds)
+        if labels is not None:
+            labels = labels.masked_fill(transition_mask, -100)
+        return inputs_embeds, labels
 
     def forward(self, input_ids=None, labels=None, training=False, att_mask=True, **kwargs):
 
@@ -328,9 +401,15 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
             # print(self.init_input_ids)
             # print(kwargs['attention_mask'])
             # import pdb; pdb.set_trace()
-            result = ChameleonForConditionalGeneration.forward(
-                self, input_ids=input_ids, **kwargs
-            )
+            inputs_embeds, _ = self._prepare_transition_inputs(input_ids)
+            if inputs_embeds is None:
+                result = ChameleonForConditionalGeneration.forward(
+                    self, input_ids=input_ids, **kwargs
+                )
+            else:
+                result = ChameleonForConditionalGeneration.forward(
+                    self, inputs_embeds=inputs_embeds, **kwargs
+                )
             return result
 
         # import pdb; pdb.set_trace()
@@ -350,12 +429,19 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
         else:
             attention_mask = self.generate_att_mask_3(input_ids)
         # import pdb; pdb.set_trace()
+
+        inputs_embeds, labels = self._prepare_transition_inputs(input_ids, labels)
                 
         # explicit use_cache=False for the following
         # https://github.com/Lightning-AI/pytorch-lightning/issues/19267
-        result = ChameleonForConditionalGeneration.forward(
-            self, input_ids=input_ids, labels=labels, use_cache=False, attention_mask=attention_mask, **kwargs
-        )
+        if inputs_embeds is None:
+            result = ChameleonForConditionalGeneration.forward(
+                self, input_ids=input_ids, labels=labels, use_cache=False, attention_mask=attention_mask, **kwargs
+            )
+        else:
+            result = ChameleonForConditionalGeneration.forward(
+                self, inputs_embeds=inputs_embeds, labels=labels, use_cache=False, attention_mask=attention_mask, **kwargs
+            )
 
         # import pdb; pdb.set_trace()
 
@@ -601,7 +687,7 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
 
 
     def get_fsdp_wrap_module_list(self) -> List:
-        modules = [*list(self.model.layers), self.lm_head, self.model.embed_tokens, self.action_head]
+        modules = [*list(self.model.layers), self.lm_head, self.model.embed_tokens, self.action_head, self.transition_token_adapter]
         if hasattr(self.model, "vqmodel"):  # may be deleted
             modules.append(self.model.vqmodel)
         return modules

@@ -22,7 +22,18 @@ logger = logging.getLogger(__name__)
 
 
 class LiberoFinetuneConversation(Dataset):
-    def __init__(self, config_path, resolution, with_state=True, with_wrist=True, with_action=True, with_world_model=True):
+    def __init__(
+        self,
+        config_path,
+        resolution,
+        with_state=True,
+        with_wrist=True,
+        with_action=True,
+        with_world_model=True,
+        with_transition_tokens=False,
+        transition_token_id=16001,
+        transition_token_count=4,
+    ):
         logger.info(f"read dataset config from {config_path}")
         with open(config_path, "r") as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
@@ -43,7 +54,15 @@ class LiberoFinetuneConversation(Dataset):
         self.with_wrist = with_wrist
         self.with_action = with_action
         self.with_world_model = with_world_model
+        self.with_transition_tokens = with_transition_tokens
+        self.transition_token = f"<reserved{int(transition_token_id):05d}>"
+        self.transition_token_count = int(transition_token_count)
         self.get_annotation_data(split=self.config["META"]["split"])
+
+    def transition_prompt(self):
+        if not self.with_transition_tokens or self.transition_token_count <= 0:
+            return ""
+        return self.transition_token * self.transition_token_count
 
 
     def get_annotation_data(self, split='train'):
@@ -191,7 +210,9 @@ class LiberoFinetuneConversation(Dataset):
                     {
                         "from": "human",
                         # Revised prompt to accurately reflect variable 'his' length
-                        "value": "Generate the next image based on the provided sequence of historical images and corresponding actions." + "<|image|><|image|><|action|>" * len(action)
+                        "value": "Generate the next image based on the provided sequence of historical images and corresponding actions."
+                        + "<|image|><|image|><|action|>" * len(action)
+                        + self.transition_prompt()
                     },
                     {
                         "from": "gpt",
@@ -203,7 +224,9 @@ class LiberoFinetuneConversation(Dataset):
                     {
                         "from": "human",
                         # Revised prompt to accurately reflect variable 'his' length
-                        "value": "Generate the next image based on the provided sequence of historical images and corresponding actions." + "<|image|><|action|>" * len(action)
+                        "value": "Generate the next image based on the provided sequence of historical images and corresponding actions."
+                        + "<|image|><|action|>" * len(action)
+                        + self.transition_prompt()
                     },
                     {
                         "from": "gpt",

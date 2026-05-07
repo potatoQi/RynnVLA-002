@@ -55,6 +55,10 @@ class Solver(PretrainSolverBase_ck_action_head):
         parser.add_argument("--with_world_model", action='store_true')
         parser.add_argument("--resolution", type=int, default=256, choices=[256, 512])
         parser.add_argument("--tokenizer_path", type=str, default="../ckpts/models--Alpha-VLLM--Lumina-mGPT-7B-768/snapshots/9624463a82ea5ce814af9b561dcd08a31082c3af")
+        parser.add_argument("--with-transition-tokens", action="store_true")
+        parser.add_argument("--transition-token-id", type=int, default=16001)
+        parser.add_argument("--transition-token-count", type=int, default=4)
+        parser.add_argument("--transition-token-hidden-mult", type=int, default=4)
         return parser
 
     def _model_func(
@@ -70,6 +74,9 @@ class Solver(PretrainSolverBase_ck_action_head):
                 init_from,
                 action_dim=self.args.action_dim,
                 time_horizon=self.args.time_horizon,
+                transition_token_id=self.args.transition_token_id,
+                transition_token_count=self.args.transition_token_count,
+                transition_token_hidden_mult=self.args.transition_token_hidden_mult,
                 max_position_embeddings=self.args.max_seq_len,
                 mask_image_logits=self.args.mask_image_logits,
                 dropout=self.args.dropout,
@@ -83,6 +90,9 @@ class Solver(PretrainSolverBase_ck_action_head):
                     init_from,
                     action_dim=self.args.action_dim,
                     time_horizon=self.args.time_horizon,
+                    transition_token_id=self.args.transition_token_id,
+                    transition_token_count=self.args.transition_token_count,
+                    transition_token_hidden_mult=self.args.transition_token_hidden_mult,
                     max_position_embeddings=self.args.max_seq_len,
                     mask_image_logits=self.args.mask_image_logits,
                     dropout=self.args.dropout,
@@ -109,6 +119,9 @@ class Solver(PretrainSolverBase_ck_action_head):
             pretrained_name,
             max_position_embeddings=self.args.max_seq_len,
             mask_image_logits=self.args.mask_image_logits,
+            transition_token_id=self.args.transition_token_id,
+            transition_token_count=self.args.transition_token_count,
+            transition_token_hidden_mult=self.args.transition_token_hidden_mult,
             dropout=self.args.dropout,
             z_loss_weight=self.args.z_loss_weight,
             torch_dtype=torch.bfloat16,

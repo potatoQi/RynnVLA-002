@@ -581,13 +581,37 @@ class PretrainSolverBase_ck_action_head(ABC):
     def _dataset_func_wo_processed(self):
      
         dataset_train = LiberoFinetuneConversation(
-            self.args.data_config_train, resolution=self.args.resolution, with_state=self.args.with_state, with_wrist=self.args.with_wrist, with_action=self.args.with_action, with_world_model=self.args.with_world_model
+            self.args.data_config_train,
+            resolution=self.args.resolution,
+            with_state=self.args.with_state,
+            with_wrist=self.args.with_wrist,
+            with_action=self.args.with_action,
+            with_world_model=self.args.with_world_model,
+            with_transition_tokens=getattr(self.args, "with_transition_tokens", False),
+            transition_token_id=getattr(self.args, "transition_token_id", 16001),
+            transition_token_count=getattr(self.args, "transition_token_count", 4),
         )
         dataset_val_ind = LiberoFinetuneConversation(
-            self.args.data_config_val_ind, resolution=self.args.resolution, with_state=self.args.with_state, with_wrist=self.args.with_wrist, with_action=self.args.with_action, with_world_model=self.args.with_world_model
+            self.args.data_config_val_ind,
+            resolution=self.args.resolution,
+            with_state=self.args.with_state,
+            with_wrist=self.args.with_wrist,
+            with_action=self.args.with_action,
+            with_world_model=self.args.with_world_model,
+            with_transition_tokens=getattr(self.args, "with_transition_tokens", False),
+            transition_token_id=getattr(self.args, "transition_token_id", 16001),
+            transition_token_count=getattr(self.args, "transition_token_count", 4),
         )
         dataset_val_ood = LiberoFinetuneConversation(
-            self.args.data_config_val_ood, resolution=self.args.resolution, with_state=self.args.with_state, with_wrist=self.args.with_wrist, with_action=self.args.with_action, with_world_model=self.args.with_world_model
+            self.args.data_config_val_ood,
+            resolution=self.args.resolution,
+            with_state=self.args.with_state,
+            with_wrist=self.args.with_wrist,
+            with_action=self.args.with_action,
+            with_world_model=self.args.with_world_model,
+            with_transition_tokens=getattr(self.args, "with_transition_tokens", False),
+            transition_token_id=getattr(self.args, "transition_token_id", 16001),
+            transition_token_count=getattr(self.args, "transition_token_count", 4),
         )
         return dataset_train, dataset_val_ind, dataset_val_ood
     

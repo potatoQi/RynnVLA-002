@@ -96,6 +96,47 @@ forward 时做：
 这样 backbone 的 AR 结构保持不变，但 transition token 会成为 future image
 token prediction 的真实条件。
 
+## 当前已落地的 Scaffold
+
+当前分支先落地了最小 soft-token scaffold：
+
+```text
+transition placeholder token id: 16001
+transition token count:          4
+CLI 参数：
+  --with-transition-tokens
+  --transition-token-id
+  --transition-token-count
+  --transition-token-hidden-mult
+```
+
+代码位置：
+
+```text
+rynnvla-002/model/configuration_xllmx_chameleon.py
+rynnvla-002/model/modeling_xllmx_chameleon_ck_action_head.py
+rynnvla-002/pretrain_solver_awm_w_ck_action_head.py
+rynnvla-002/data/dataset.py
+xllmx/solvers/pretrain/pretrain_ck_action_head.py
+```
+
+当前实现逻辑：
+
+```text
+1. 数据里如果没有 token id 16001，模型行为保持原样；
+2. no-pretokenize 数据路径在加 `--with-transition-tokens` 后，会把
+   `<reserved16001>` 插到 world-model prompt 的 action block 后；
+3. 如果 input_ids 中出现 token id 16001，则认为这些位置是 transition placeholder；
+4. 模型用 placeholder 之前的上下文 embedding 做 mean pooling；
+5. TransitionTokenAdapter 把 pooled context 映射成连续 soft tokens；
+6. 用这些 soft tokens 替换 placeholder 的普通 embedding；
+7. placeholder 对应 labels 强制设为 -100，不参与 CE；
+8. future image tokens 继续按原始 causal LM CE 训练。
+```
+
+这个版本还没有接入 triangle loss，也还没有显式区分 `e_ik/e_kj/e_ij`。它的作用是
+先打通“AR token backbone 能接收连续 transition soft token 条件”的工程入口。
+
 ## Loss 如何映射
 
 我们保留当前 transition-field baseline loss 的逻辑，但视觉目标从 latent MSE
