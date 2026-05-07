@@ -49,6 +49,7 @@ class Solver(PretrainSolverBase_ck_action_head):
         parser.add_argument("--action_dim", type=int, default=7)
         parser.add_argument("--time_horizon", type=int, default=5)
         parser.add_argument("--preprocess", default='true', choices=['true', 'false'])
+        parser.add_argument("--dataset-kind", default="libero", choices=["libero", "bair_npz"])
         parser.add_argument("--with_state", action='store_true')
         parser.add_argument("--with_wrist", action='store_true')
         parser.add_argument("--with_action", action='store_true')

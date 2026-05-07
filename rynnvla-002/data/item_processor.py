@@ -17,6 +17,25 @@ from transformers import AutoProcessor
 logger = logging.getLogger(__name__)
 
 
+LIBERO_ACTION_MIN = np.array([-0.9375, -0.9375, -0.9375, -0.32571429, -0.375, -0.375, -1.0])
+LIBERO_ACTION_MAX = np.array([0.9375, 0.9375, 0.9375, 0.375, 0.375, 0.375, 1.0])
+BAIR_ACTION_MIN = np.array([-0.06998102, -0.0699713, 0.0, 0.0])
+BAIR_ACTION_MAX = np.array([0.06991026, 0.06998004, 4.0, 4.0])
+
+
+def min_max_normalize(values, min_values, max_values):
+    norm_values = 2 * (values - min_values) / (max_values - min_values + 1e-8) - 1
+    return np.clip(norm_values, a_min=-1, a_max=1)
+
+
+def normalize_action_by_dim(action):
+    if action.shape[-1] == 4:
+        return min_max_normalize(action, BAIR_ACTION_MIN, BAIR_ACTION_MAX)
+    if action.shape[-1] == 7:
+        return min_max_normalize(action, LIBERO_ACTION_MIN, LIBERO_ACTION_MAX)
+    raise ValueError(f"unsupported action dim {action.shape[-1]}, expected 4 for BAIR or 7 for LIBERO")
+
+
 def center_crop(pil_image, crop_size):
     while pil_image.size[0] >= 2 * crop_size[0] and pil_image.size[1] >= 2 * crop_size[1]:
         pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
@@ -324,14 +343,7 @@ class FlexARItemProcessor_Action(MMConvItemProcessor):
         return bin_centers[discretized_actions]
     
     def norm_action(self, action):
-        min_values = np.array([-0.9375, -0.9375, -0.9375, -0.32571429, -0.375, -0.375, -1.0])
-        max_values = np.array([0.9375, 0.9375, 0.9375, 0.375, 0.375, 0.375, 1.0])
-        # min_values = np.array([-0.06998102, -0.0699713, 0, 0])
-        # max_values = np.array([0.06991026, 0.06998004, 4, 4])
-        norm_action = 2 * (action - min_values) / (max_values - min_values + 1e-8) - 1
-        norm_action = np.clip(norm_action, a_min=-1, a_max=1)
-        
-        return norm_action
+        return normalize_action_by_dim(action)
 
     def process_item(self, item, training_mode=False, out_flatten=True):
         if not out_flatten:
@@ -545,13 +557,12 @@ class FlexARItemProcessor_Action_State(MMConvItemProcessor):
     
     def norm_action(self, action):
         # spatial, object, goal, 10   no_ops
+        if action.shape[-1] == 4:
+            return min_max_normalize(action, BAIR_ACTION_MIN, BAIR_ACTION_MAX)
+
         min_values = np.array([-0.9375, -0.9375, -0.9375, -0.24214286, -0.375, -0.36428571, -1.0])
         max_values = np.array([0.9375, 0.9375, 0.9375, 0.34821429, 0.375, 0.375, 1.0])
-
-        norm_action = 2 * (action - min_values) / (max_values - min_values + 1e-8) - 1
-        norm_action = np.clip(norm_action, a_min=-1, a_max=1)
-        
-        return norm_action
+        return min_max_normalize(action, min_values, max_values)
         
     
     def norm_state(self, state):
@@ -796,4 +807,3 @@ class FlexARItemProcessor_Action_FAST(MMConvItemProcessor):
         tokens = tokens.view(h_latent_dim, w_latent_dim + 1)[:, :-1].flatten()
 
         return self.chameleon_ori_image_tokenizer.pil_from_img_toks(tokens, h_latent_dim, w_latent_dim)
-

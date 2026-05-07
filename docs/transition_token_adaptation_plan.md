@@ -117,8 +117,45 @@ rynnvla-002/model/configuration_xllmx_chameleon.py
 rynnvla-002/model/modeling_xllmx_chameleon_ck_action_head.py
 rynnvla-002/pretrain_solver_awm_w_ck_action_head.py
 rynnvla-002/data/dataset.py
+rynnvla-002/data/item_processor.py
 xllmx/solvers/pretrain/pretrain_ck_action_head.py
+rynnvla-002/configs/bair_robot_pushing/
+rynnvla-002/exps_bair_world_model/
 ```
+
+新增 BAIR no-pretokenize world-model 入口：
+
+```text
+--dataset-kind bair_npz
+--action_dim 4
+--time_horizon 1
+```
+
+BAIR shard 读取格式：
+
+```text
+frames:  [N, T, H, W, C]
+actions: [N, T-1, 4]
+```
+
+当前支持两类 sample mode：
+
+```text
+one_step:
+  image_t + action_t -> image_{t+1}
+
+direct_endpoint:
+  image_i + sum(action_i:j) -> image_j
+```
+
+第一版训练脚本：
+
+```text
+cd rynnvla-002/exps_bair_world_model
+bash train_bair_transition_tokens_nopretokenize.sh
+```
+
+它只是 Phase 1 的 one-step transition-token conditioning，不是最终 triangle loss。
 
 当前实现逻辑：
 

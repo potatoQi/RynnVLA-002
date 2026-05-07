@@ -8,13 +8,11 @@ from time import sleep
 import traceback
 import warnings
 import math
-import h5py
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
 import yaml
 
-from libero.libero import benchmark
 from PIL import Image
 import numpy as np
 
@@ -39,6 +37,8 @@ class LiberoFinetuneConversation(Dataset):
             self.config = yaml.load(f, Loader=yaml.FullLoader)
         logger.info("DATASET CONFIG:")
         logger.info(self.config)
+
+        from libero.libero import benchmark
 
         benchmark_dict = benchmark.get_benchmark_dict()
         logger.info(benchmark_dict)
@@ -152,6 +152,8 @@ class LiberoFinetuneConversation(Dataset):
         return len(self.data_list)
 
     def __getitem__(self, idx):
+        import h5py
+
         action_ids = self.data_list[idx]['action_ids']
         trj = self.data_list[idx]['trj']
         task_id = self.data_list[idx]['task_id']
@@ -237,6 +239,141 @@ class LiberoFinetuneConversation(Dataset):
         # print('***********')
         # tokens, labels = self.item_processor.process_item(conv, training_mode=True)
         return conversations, images, action, combined_state
+
+
+class BairRobotPushingConversation(Dataset):
+    """BAIR robot pushing shards -> RynnVLA world-model conversation.
+
+    Expected shard format:
+
+    ```text
+    frames:  [N, T, H, W, C] uint8 or float in [0, 1]
+    actions: [N, T-1, A]
+    ```
+
+    The first stage uses one-step samples so it can reuse the existing
+    autoregressive CE training loop. `direct_endpoint` is a scaffold for later
+    multi-hop experiments: it sums actions from i to j and predicts frame j
+    from frame i.
+    """
+
+    def __init__(
+        self,
+        config_path,
+        resolution,
+        with_transition_tokens=False,
+        transition_token_id=16001,
+        transition_token_count=4,
+    ):
+        logger.info(f"read BAIR dataset config from {config_path}")
+        with open(config_path, "r") as f:
+            self.config = yaml.load(f, Loader=yaml.FullLoader)
+        logger.info("BAIR DATASET CONFIG:")
+        logger.info(self.config)
+
+        meta = self.config["META"]
+        bair_cfg = self.config.get("bair", {})
+        self.raw_data_dir = Path(meta["raw_data_dir"])
+        self.frames_key = bair_cfg.get("frames_key", "frames")
+        self.actions_key = bair_cfg.get("actions_key", "actions")
+        self.sample_mode = bair_cfg.get("sample_mode", "one_step")
+        self.min_dt = int(bair_cfg.get("min_dt", 1))
+        self.max_dt = int(bair_cfg.get("max_dt", 1))
+        self.max_samples = bair_cfg.get("max_samples")
+        self.with_transition_tokens = with_transition_tokens
+        self.transition_token = f"<reserved{int(transition_token_id):05d}>"
+        self.transition_token_count = int(transition_token_count)
+        self.files = sorted(self.raw_data_dir.glob("*.npz"))
+        if not self.files:
+            raise FileNotFoundError(f"no .npz BAIR shards found under {self.raw_data_dir}")
+
+        self.data_list = []
+        self._cache_file_idx = None
+        self._cache = None
+        self._build_index()
+
+    def _build_index(self):
+        for file_idx, shard_path in enumerate(self.files):
+            with np.load(shard_path) as shard:
+                frames_shape = shard[self.frames_key].shape
+                actions_shape = shard[self.actions_key].shape
+            num_sequences, num_frames = frames_shape[0], frames_shape[1]
+            num_actions = actions_shape[1]
+            max_start = min(num_frames - 1, num_actions)
+
+            if self.sample_mode == "one_step":
+                for seq_idx in range(num_sequences):
+                    for start in range(max_start):
+                        self.data_list.append((file_idx, seq_idx, start, start + 1))
+            elif self.sample_mode == "direct_endpoint":
+                for seq_idx in range(num_sequences):
+                    for start in range(max_start):
+                        max_dt = min(self.max_dt, num_frames - 1 - start, num_actions - start)
+                        for dt in range(self.min_dt, max_dt + 1):
+                            self.data_list.append((file_idx, seq_idx, start, start + dt))
+            else:
+                raise ValueError(f"unknown BAIR sample_mode: {self.sample_mode}")
+
+        if self.max_samples is not None:
+            self.data_list = self.data_list[: int(self.max_samples)]
+        logger.info(f"loaded {len(self.data_list)} BAIR world-model samples from {len(self.files)} shards")
+
+    def transition_prompt(self):
+        if not self.with_transition_tokens or self.transition_token_count <= 0:
+            return ""
+        return self.transition_token * self.transition_token_count
+
+    def _load_shard(self, file_idx):
+        if self._cache_file_idx == file_idx and self._cache is not None:
+            return self._cache
+
+        shard_path = self.files[file_idx]
+        with np.load(shard_path) as shard:
+            self._cache = {
+                self.frames_key: shard[self.frames_key],
+                self.actions_key: shard[self.actions_key],
+            }
+        self._cache_file_idx = file_idx
+        return self._cache
+
+    @staticmethod
+    def _frame_to_image(frame):
+        frame = np.asarray(frame)
+        if frame.ndim != 3:
+            raise ValueError(f"expected frame [H,W,C] or [C,H,W], got {frame.shape}")
+        if frame.shape[0] in {1, 3} and frame.shape[-1] not in {1, 3}:
+            frame = np.transpose(frame, (1, 2, 0))
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0.0, 1.0)
+            frame = (frame * 255.0).round().astype(np.uint8)
+        return Image.fromarray(frame)
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        file_idx, seq_idx, start, end = self.data_list[idx]
+        shard = self._load_shard(file_idx)
+        frames = shard[self.frames_key][seq_idx]
+        actions = shard[self.actions_key][seq_idx]
+
+        image_i = self._frame_to_image(frames[start])
+        image_j = self._frame_to_image(frames[end])
+        action = actions[start:end].sum(axis=0).astype(np.float32)
+
+        conversations = [
+            {
+                "from": "human",
+                "value": "Generate the next image based on the current image and action."
+                + "<|image|><|action|>"
+                + self.transition_prompt(),
+            },
+            {
+                "from": "gpt",
+                "value": "<|image|>",
+            },
+        ]
+        return conversations, [image_i, image_j], [action], []
 
 if __name__=='__main__':
     data = LiberoFinetuneConversation('/mnt/damorobot/yuanyq/code/WorldVLA-main/worldvla/configs/libero_256_all/debug.yaml', 256, True)
