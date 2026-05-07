@@ -61,6 +61,13 @@ def load_dataset_config(config_path):
         return config
 
 
+def reserved_token_from_id(token_id):
+    token_id = int(token_id)
+    if token_id < 4:
+        raise ValueError(f"reserved token id must be >= 4, got {token_id}")
+    return f"<reserved{token_id - 4:05d}>"
+
+
 class LiberoFinetuneConversation(Dataset):
     def __init__(
         self,
@@ -96,7 +103,7 @@ class LiberoFinetuneConversation(Dataset):
         self.with_action = with_action
         self.with_world_model = with_world_model
         self.with_transition_tokens = with_transition_tokens
-        self.transition_token = f"<reserved{int(transition_token_id):05d}>"
+        self.transition_token = reserved_token_from_id(transition_token_id)
         self.transition_token_count = int(transition_token_count)
         self.get_annotation_data(split=self.config["META"]["split"])
 
@@ -322,7 +329,7 @@ class BairRobotPushingConversation(Dataset):
         self.max_shards = bair_cfg.get("max_shards")
         self.max_samples = bair_cfg.get("max_samples")
         self.with_transition_tokens = with_transition_tokens
-        self.transition_token = f"<reserved{int(transition_token_id):05d}>"
+        self.transition_token = reserved_token_from_id(transition_token_id)
         self.transition_token_count = int(transition_token_count)
         self.files = sorted(self.raw_data_dir.glob("*.npz"))
         if self.max_shards is not None:
