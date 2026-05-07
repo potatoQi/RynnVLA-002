@@ -53,6 +53,30 @@ torch==2.2.0+cu121
 torch.cuda.is_available() == True
 ```
 
+必要 checkpoint 放在：
+
+```text
+rynnvla-002/ckpts/chameleon/tokenizer
+rynnvla-002/ckpts/chameleon/starting_point
+rynnvla-002/ckpts/starting_point -> chameleon/starting_point
+rynnvla-002/ckpts/base_model
+```
+
+当前下载优先级是：先拿到 tokenizer、VQGAN tokenizer、`starting_point`
+权重和 base model 的 HF tokenizer 文件；完整 `base_model` 权重不是 Phase 0/1
+训练 smoke 的必需项。
+
+大文件下载可用 `hf-mirror + aria2c` 断点续传：
+
+```bash
+aria2c -c -x 16 -s 16 -k 1M -j 3 \
+  --retry-wait=5 --max-tries=0 \
+  --timeout=60 --connect-timeout=20 \
+  --auto-file-renaming=false \
+  --allow-overwrite=false \
+  -i /tmp/rynnvla-worldvla-aria2.txt
+```
+
 ## 当前 Backbone 接口
 
 no-pretokenize 的 LIBERO world-model dataset 当前返回：
@@ -180,6 +204,25 @@ direct_endpoint:
 cd rynnvla-002/exps_bair_world_model
 bash train_bair_transition_tokens_nopretokenize.sh
 ```
+
+小规模 smoke 训练脚本：
+
+```text
+cd rynnvla-002/exps_bair_world_model
+bash train_bair_transition_tokens_smoke.sh
+```
+
+smoke 配置只读取 1 个 BAIR shard、16 个样本，并设置：
+
+```text
+--trainable-scope transition_only
+--batch_size 1
+--num_workers 0
+```
+
+正式 BAIR one-step 入口同样默认先用 `transition_only`，也就是冻结 Chameleon
+backbone，只训练 `transition_token_adapter`。这是 Phase 1 的默认设置；如果后面
+要对 backbone 做 LoRA 或全参微调，再单独新增训练范围。
 
 它只是 Phase 1 的 one-step transition-token conditioning，不是最终 triangle loss。
 
