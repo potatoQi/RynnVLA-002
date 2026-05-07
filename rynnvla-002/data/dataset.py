@@ -319,11 +319,14 @@ class BairRobotPushingConversation(Dataset):
         self.sample_mode = bair_cfg.get("sample_mode", "one_step")
         self.min_dt = int(bair_cfg.get("min_dt", 1))
         self.max_dt = int(bair_cfg.get("max_dt", 1))
+        self.max_shards = bair_cfg.get("max_shards")
         self.max_samples = bair_cfg.get("max_samples")
         self.with_transition_tokens = with_transition_tokens
         self.transition_token = f"<reserved{int(transition_token_id):05d}>"
         self.transition_token_count = int(transition_token_count)
         self.files = sorted(self.raw_data_dir.glob("*.npz"))
+        if self.max_shards is not None:
+            self.files = self.files[: int(self.max_shards)]
         if not self.files:
             raise FileNotFoundError(f"no .npz BAIR shards found under {self.raw_data_dir}")
 

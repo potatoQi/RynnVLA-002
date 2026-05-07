@@ -4,9 +4,9 @@ set -euo pipefail
 export TOKENIZERS_PARALLELISM=false
 
 ARG_WORLD_SIZE=${1:-1}
-ARG_NPROC_PER_NODE=${2:-8}
+ARG_NPROC_PER_NODE=${2:-1}
 ARG_MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-ARG_MASTER_PORT=${MASTER_PORT:-16677}
+ARG_MASTER_PORT=${MASTER_PORT:-16679}
 ARG_RANK=${RANK:-0}
 
 WORLD_SIZE=${WORLD_SIZE:-$ARG_WORLD_SIZE}
@@ -20,11 +20,9 @@ wd=0.1
 dropout=0.05
 z_loss_weight=1e-5
 
-data_config_train=../configs/bair_robot_pushing/his_1_world_model_nopretokenize_train.yaml
-data_config_val_ind=../configs/bair_robot_pushing/his_1_world_model_nopretokenize_test.yaml
-data_config_val_ood=../configs/bair_robot_pushing/his_1_world_model_nopretokenize_test.yaml
+data_config=../configs/bair_robot_pushing/his_1_world_model_nopretokenize_smoke.yaml
 
-exp_name=bair_his_1_world_model_transition_tokens
+exp_name=bair_his_1_world_model_transition_tokens_smoke
 output_dir=../outputs/bair_robot_pushing
 mkdir -p "$output_dir"/"$exp_name"
 
@@ -47,7 +45,7 @@ mkdir -p "$output_dir"/"$exp_name"
   --ablation 0 \
   --model_size 7B \
   --trainable-scope transition_only \
-  --batch_size 8 \
+  --batch_size 1 \
   --accum_iter 1 \
   --epochs 1 \
   --warmup_epochs 0.01 \
@@ -59,17 +57,17 @@ mkdir -p "$output_dir"/"$exp_name"
   --time_horizon 1 \
   --transition-token-id 16001 \
   --transition-token-count 4 \
-  --data_config_train $data_config_train \
-  --data_config_val_ind $data_config_val_ind \
-  --data_config_val_ood $data_config_val_ood \
-  --num_workers 8 \
+  --data_config_train $data_config \
+  --data_config_val_ind $data_config \
+  --data_config_val_ood $data_config \
+  --num_workers 0 \
   --output_dir "$output_dir"/"$exp_name" \
   --checkpointing \
   --max_seq_len 8192 \
   --unmask_image_logits \
   --dropout ${dropout} \
   --z_loss_weight ${z_loss_weight} \
-  --ckpt_max_keep 2 \
+  --ckpt_max_keep 1 \
   2>&1 | tee -a "$output_dir"/"$exp_name"/output.log
 
 echo "exp name: $exp_name"

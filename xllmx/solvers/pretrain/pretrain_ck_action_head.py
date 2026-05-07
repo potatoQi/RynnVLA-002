@@ -273,6 +273,12 @@ class PretrainSolverBase_ck_action_head(ABC):
         parser.add_argument("--ablation", type=str, choices=["0", "1", "2", "3", "4", "5"], default="fp32")
         parser.add_argument("--loss_ct_weights", type=int, default=10)
         parser.add_argument("--loss_img_weights", type=float, default=0.04)
+        parser.add_argument(
+            "--trainable-scope",
+            default="all",
+            choices=["all", "transition_only"],
+            help="which parameters to train; transition_only keeps the Chameleon backbone frozen",
+        )
 
 
         return parser
@@ -307,7 +313,19 @@ class PretrainSolverBase_ck_action_head(ABC):
 
         # only rank 0 instantiate, otherwise to meta
         unwrapped_model, tokenizer = self._model_func(init_from)
-        if hasattr(unwrapped_model, "get_trainable_params"):
+        trainable_scope = getattr(self.args, "trainable_scope", "all")
+        if trainable_scope == "transition_only":
+            found_trainable = False
+            for key, param in unwrapped_model.named_parameters():
+                is_trainable = key.startswith("transition_token_adapter.")
+                param.requires_grad = is_trainable
+                if is_trainable:
+                    found_trainable = True
+                    promote_param_to_fp32(param)
+            if not found_trainable:
+                raise ValueError("trainable_scope=transition_only but model has no transition_token_adapter params")
+            self.logger.info("Trainable scope: transition_token_adapter only; backbone parameters stay frozen.")
+        elif hasattr(unwrapped_model, "get_trainable_params"):
             trainable_params = dict(unwrapped_model.get_trainable_params())
             for key, param in unwrapped_model.named_parameters():
                 if key in trainable_params or 'lora' in key:
