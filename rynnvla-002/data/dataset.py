@@ -8,15 +8,57 @@ from time import sleep
 import traceback
 import warnings
 import math
-import torch
-import torch.distributed as dist
-from torch.utils.data import Dataset
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
+try:
+    from torch.utils.data import Dataset
+except ImportError:
+    class Dataset:
+        pass
 
 from PIL import Image
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def parse_simple_value(value):
+    value = value.strip().strip("'").strip('"')
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def load_dataset_config(config_path):
+    with open(config_path, "r") as f:
+        if yaml is not None:
+            return yaml.load(f, Loader=yaml.FullLoader)
+
+        config = {}
+        current_section = None
+        for raw_line in f:
+            line = raw_line.split("#", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            if not line.startswith(" "):
+                key = line.rstrip(":")
+                config[key] = {}
+                current_section = key
+                continue
+            if current_section is None:
+                raise ValueError(f"invalid config line before section: {raw_line!r}")
+            key, value = line.strip().split(":", 1)
+            config[current_section][key] = parse_simple_value(value)
+        return config
 
 
 class LiberoFinetuneConversation(Dataset):
@@ -33,8 +75,7 @@ class LiberoFinetuneConversation(Dataset):
         transition_token_count=4,
     ):
         logger.info(f"read dataset config from {config_path}")
-        with open(config_path, "r") as f:
-            self.config = yaml.load(f, Loader=yaml.FullLoader)
+        self.config = load_dataset_config(config_path)
         logger.info("DATASET CONFIG:")
         logger.info(self.config)
 
@@ -266,8 +307,7 @@ class BairRobotPushingConversation(Dataset):
         transition_token_count=4,
     ):
         logger.info(f"read BAIR dataset config from {config_path}")
-        with open(config_path, "r") as f:
-            self.config = yaml.load(f, Loader=yaml.FullLoader)
+        self.config = load_dataset_config(config_path)
         logger.info("BAIR DATASET CONFIG:")
         logger.info(self.config)
 

@@ -27,6 +27,32 @@ rynnvla-002/eval_solver_libero_g_video_512_third_wrist.py
 rynnvla-002/exps_libero_world_model/calculate_world_model_performance.py
 ```
 
+## 环境约定
+
+RynnVLA-002 子模块使用独立 uv 环境，避免和 beta 主项目环境互相污染：
+
+```text
+external/RynnVLA-002/.venv
+```
+
+创建和安装命令：
+
+```bash
+cd external/RynnVLA-002
+uv venv --python /usr/bin/python3.10 .venv
+rg -v '^nvidia-' requirements.txt > /tmp/rynnvla-requirements-nonvidia.txt
+uv pip install --python .venv/bin/python -r /tmp/rynnvla-requirements-nonvidia.txt
+```
+
+这里不是裁掉 CUDA 依赖，而是避免 requirements 中显式写死的 `nvidia-*`
+版本和 `torch==2.2.0` 自身依赖互相冲突；最终 CUDA wheel 由 torch 解析得到。
+当前环境验证到：
+
+```text
+torch==2.2.0+cu121
+torch.cuda.is_available() == True
+```
+
 ## 当前 Backbone 接口
 
 no-pretokenize 的 LIBERO world-model dataset 当前返回：
