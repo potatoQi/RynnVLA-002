@@ -15,7 +15,7 @@ class ChameleonXLLMXConfig(ChameleonConfig):
         time_horizon: int = 5,
         transition_token_id: int = 16001,
         transition_token_count: int = 4,
-        transition_token_hidden_mult: int = 4,
+        transition_token_hidden_mult: int = 1,
         **kwargs,
     ):
         self.z_loss_weight = z_loss_weight

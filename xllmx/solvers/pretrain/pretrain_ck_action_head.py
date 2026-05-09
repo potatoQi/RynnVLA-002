@@ -9,6 +9,8 @@ import logging
 import math
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import time
 from typing import Optional, Union
@@ -53,11 +55,28 @@ import xllmx.util.misc as misc
 from xllmx.util.tensor_type import promote_param_to_fp32
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"yes", "true", "t", "1", "y"}:
+        return True
+    if value in {"no", "false", "f", "0", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 class PretrainSolverBase_ck_action_head(ABC):
 
     def __init__(self, args):
         self.args = args
         util.dist.init_distributed_mode(args)
+        if self.args.metrics_dir is None:
+            self.args.metrics_dir = os.path.join(self.args.output_dir, "metrics")
+        if args.output_dir and dist.get_rank() == 0:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            Path(args.metrics_dir).mkdir(parents=True, exist_ok=True)
+        dist.barrier()
         self.logger = self.configure_logger()
         self.logger.info(args)
 
@@ -93,6 +112,7 @@ class PretrainSolverBase_ck_action_head(ABC):
 
         if args.output_dir and self.global_rank == 0:
             Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            Path(args.metrics_dir).mkdir(parents=True, exist_ok=True)
         dist.barrier()
 
         if args.precision == "tf32":
@@ -179,6 +199,425 @@ class PretrainSolverBase_ck_action_head(ABC):
 
         return logger
 
+    def _jsonable(self, value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu()
+            if value.numel() == 1:
+                return value.item()
+            return value.tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.floating, np.integer)):
+            return value.item()
+        if isinstance(value, dict):
+            return {key: self._jsonable(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._jsonable(val) for val in value]
+        return value
+
+    def _group_metrics(self, metrics):
+        grouped = {
+            "losses": {},
+            "accuracies": {},
+            "action": {},
+            "optimization": {},
+            "other": {},
+        }
+        for key, value in metrics.items():
+            if key in {"epoch", "iteration", "global_step", "split", "phase"}:
+                continue
+            if key in {
+                "lr",
+                "grad_norm",
+                "cuda_allocated_memory_mb",
+                "cuda_reserved_memory_mb",
+                "cuda_max_allocated_memory_mb",
+                "cuda_max_reserved_memory_mb",
+            }:
+                group = "optimization"
+            elif key.startswith("acc_"):
+                group = "accuracies"
+            elif key.startswith("l1_loss_action"):
+                group = "action"
+            elif "loss" in key or key in {"closs", "loss_ct", "z_loss"}:
+                group = "losses"
+            else:
+                group = "other"
+            grouped[group][key] = self._jsonable(value)
+        return {key: val for key, val in grouped.items() if val}
+
+    def _progress_record(self, global_step):
+        if global_step is None:
+            return {}
+        start_time = getattr(self, "_train_started_at", None)
+        if start_time is None:
+            return {}
+        total_steps = getattr(self, "_estimated_total_train_steps", None)
+        run_start_step = getattr(self, "_run_start_global_step", 0)
+        elapsed_sec = max(0.0, time.time() - start_time)
+        completed_since_start = max(float(global_step - run_start_step), 1.0)
+        sec_per_step = elapsed_sec / completed_since_start
+        progress = {
+            "elapsed_sec": elapsed_sec,
+            "sec_per_step": sec_per_step,
+        }
+        if total_steps is not None and total_steps > 0:
+            remaining_steps = max(int(total_steps) - int(global_step), 0)
+            eta_sec = remaining_steps * sec_per_step
+            progress.update(
+                {
+                    "total_steps": int(total_steps),
+                    "remaining_steps": remaining_steps,
+                    "eta_sec": eta_sec,
+                    "estimated_finish_time": (
+                        datetime.datetime.now() + datetime.timedelta(seconds=int(eta_sec))
+                    ).isoformat(timespec="seconds"),
+                }
+            )
+        return progress
+
+    def _write_metric_record(self, *, phase, split, metrics, epoch=None, iteration=None, global_step=None):
+        if self.global_rank != 0:
+            return
+
+        record = {
+            "phase": phase,
+            "split": split,
+            "epoch": epoch,
+            "iteration": iteration,
+            "global_step": global_step,
+            "metrics": self._group_metrics(metrics),
+        }
+        progress = self._progress_record(global_step)
+        if progress:
+            record["progress"] = progress
+        metrics_dir = Path(self.args.metrics_dir)
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        with open(metrics_dir / "metrics.jsonl", mode="a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with open(metrics_dir / "latest.json", mode="w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        with open(metrics_dir / f"latest_{phase}_{split}.json", mode="w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+
+    def _append_flat_log(self, filename, stats, epoch=None, iteration=None, global_step=None, prefix=None):
+        if self.global_rank != 0:
+            return
+        log_stats = {**{f"{prefix}_{key}" if prefix else key: self._jsonable(val) for key, val in stats.items()}}
+        if epoch is not None:
+            log_stats["epoch"] = epoch
+        if iteration is not None:
+            log_stats["iteration"] = iteration
+        if global_step is not None:
+            log_stats["global_step"] = global_step
+        with open(os.path.join(self.args.output_dir, filename), mode="a", encoding="utf-8") as f:
+            f.write(json.dumps(log_stats, ensure_ascii=False) + "\n")
+
+    def _save_checkpoint(self, *, epoch, iteration=None):
+        util.ckpt.save(
+            self.args.output_dir,
+            self.global_rank == 0,
+            self.model,
+            self.optimizer,
+            self.tokenizer,
+            self.args,
+            epoch=epoch,
+            iteration=iteration,
+            additional_rank_specific={
+                "metric_logger": self.metric_logger_to_resume,
+            } if self.metric_logger_to_resume is not None else None,
+            max_keep=self.args.ckpt_max_keep,
+        )
+        checkpoint_path = self._rollout_checkpoint_path(epoch=epoch, iteration=iteration)
+        if self.global_rank == 0:
+            self._update_latest_checkpoint_alias(checkpoint_path)
+        dist.barrier()
+        return checkpoint_path
+
+    def _update_latest_checkpoint_alias(self, checkpoint_path: str) -> None:
+        latest_path = os.path.join(self.args.output_dir, "latest")
+        tmp_path = os.path.join(self.args.output_dir, ".latest.tmp")
+        try:
+            if os.path.lexists(tmp_path):
+                os.unlink(tmp_path)
+            os.symlink(os.path.basename(checkpoint_path), tmp_path)
+            os.replace(tmp_path, latest_path)
+        except OSError as exc:
+            self.logger.warning("failed to update latest checkpoint symlink %s -> %s: %s", latest_path, checkpoint_path, exc)
+
+    @staticmethod
+    def _copy_checkpoint_tree(src: str, dst: str) -> None:
+        tmp_dst = f"{dst}.tmp"
+        if os.path.exists(tmp_dst):
+            shutil.rmtree(tmp_dst)
+        try:
+            shutil.copytree(src, tmp_dst, copy_function=os.link)
+        except OSError:
+            if os.path.exists(tmp_dst):
+                shutil.rmtree(tmp_dst)
+            shutil.copytree(src, tmp_dst, copy_function=shutil.copy2)
+        if os.path.exists(dst):
+            shutil.rmtree(dst)
+        os.replace(tmp_dst, dst)
+
+    def _maybe_update_best_checkpoint(self, *, eval_stats, checkpoint_path, epoch, iteration, global_step) -> None:
+        metric_name = self.args.best_checkpoint_metric
+        if not metric_name:
+            return
+
+        if self.global_rank != 0:
+            dist.barrier()
+            return
+
+        try:
+            split_stats = eval_stats.get(self.args.best_checkpoint_split, {})
+            if metric_name not in split_stats:
+                self.logger.warning(
+                    "best checkpoint metric %s/%s not found; available metrics=%s",
+                    self.args.best_checkpoint_split,
+                    metric_name,
+                    sorted(split_stats.keys()),
+                )
+                return
+            score = float(split_stats[metric_name])
+            if not math.isfinite(score):
+                self.logger.warning("best checkpoint metric is non-finite: %s=%s", metric_name, score)
+                return
+
+            meta_path = os.path.join(self.args.output_dir, "best_checkpoint.json")
+            best_score = None
+            if os.path.exists(meta_path):
+                with open(meta_path, encoding="utf-8") as f:
+                    best_score = float(json.load(f)["score"])
+            if self.args.best_checkpoint_mode == "min":
+                improved = best_score is None or score < best_score
+            else:
+                improved = best_score is None or score > best_score
+
+            if not improved:
+                self.logger.info(
+                    "best checkpoint unchanged: current %s/%s=%s, best=%s",
+                    self.args.best_checkpoint_split,
+                    metric_name,
+                    score,
+                    best_score,
+                )
+                return
+
+            best_dir = os.path.join(self.args.output_dir, self.args.best_checkpoint_dir)
+            self.logger.info(
+                "updating best checkpoint: %s/%s=%s from %s",
+                self.args.best_checkpoint_split,
+                metric_name,
+                score,
+                checkpoint_path,
+            )
+            self._copy_checkpoint_tree(checkpoint_path, best_dir)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "checkpoint": os.path.basename(checkpoint_path),
+                        "best_dir": self.args.best_checkpoint_dir,
+                        "split": self.args.best_checkpoint_split,
+                        "metric": metric_name,
+                        "mode": self.args.best_checkpoint_mode,
+                        "score": score,
+                        "epoch": epoch,
+                        "iteration": iteration,
+                        "global_step": global_step,
+                    },
+                    f,
+                    indent=2,
+                )
+        finally:
+            dist.barrier()
+
+    def _rollout_checkpoint_path(self, *, epoch, iteration):
+        save_name = f"epoch{epoch}"
+        if iteration is not None:
+            save_name += f"-iter{iteration}"
+        return os.path.abspath(os.path.join(self.args.output_dir, save_name))
+
+    def _rollout_gpus_have_room(self, gpu_ids: list[str]) -> bool:
+        if self.args.rollout_eval_min_free_mb <= 0:
+            return True
+        for gpu_id in gpu_ids:
+            try:
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "-i",
+                        gpu_id,
+                        "--query-gpu=memory.free",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    self.logger.warning("rollout eval memory query failed on GPU %s: %s", gpu_id, result.stderr.strip())
+                    return False
+                free_mb = int(result.stdout.strip().splitlines()[0].strip())
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("rollout eval memory query failed on GPU %s: %s", gpu_id, exc)
+                return False
+            if free_mb < self.args.rollout_eval_min_free_mb:
+                return False
+        return True
+
+    def _wait_for_rollout_gpus(self, gpu_ids: list[str]) -> bool:
+        start = time.time()
+        while True:
+            if self._rollout_gpus_have_room(gpu_ids):
+                return True
+            timeout = self.args.rollout_eval_timeout_seconds
+            if timeout > 0 and time.time() - start >= timeout:
+                return False
+            self.logger.info(
+                "waiting for rollout eval GPU memory: gpu_ids=%s min_free_mb=%s",
+                ",".join(gpu_ids),
+                self.args.rollout_eval_min_free_mb,
+            )
+            time.sleep(max(1, self.args.rollout_eval_poll_seconds))
+
+    def _run_rollout_eval_for_checkpoint(self, *, epoch, iteration, global_step):
+        if self.args.rollout_eval_iteration_interval <= 0:
+            return
+        if self.global_rank != 0:
+            dist.barrier()
+            return
+
+        try:
+            if not self.args.rollout_eval_gpu_ids:
+                self.logger.warning("rollout eval requested but --rollout_eval_gpu_ids is empty; skip")
+                return
+
+            workdir = self.args.rollout_eval_workdir or os.getcwd()
+            gpu_ids = [gpu.strip() for gpu in self.args.rollout_eval_gpu_ids.split(",") if gpu.strip()]
+            if len(gpu_ids) < self.args.rollout_eval_num_gpus:
+                self.logger.warning(
+                    "rollout eval requested %s GPU(s), but got gpu_ids=%s; skip",
+                    self.args.rollout_eval_num_gpus,
+                    self.args.rollout_eval_gpu_ids,
+                )
+                return
+            checkpoint_path = self._rollout_checkpoint_path(epoch=epoch, iteration=iteration)
+            eval_name = f"rollout_iter{iteration}_step{global_step}"
+            out_dir = os.path.abspath(os.path.join(self.args.output_dir, "periodic_rollout_eval", eval_name))
+            if not self._wait_for_rollout_gpus(gpu_ids[: self.args.rollout_eval_num_gpus]):
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(out_dir, "rollout_eval_status.json"), "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "status": "skipped",
+                            "reason": "insufficient_free_gpu_memory",
+                            "checkpoint_path": checkpoint_path,
+                            "gpu_ids": gpu_ids[: self.args.rollout_eval_num_gpus],
+                            "min_free_mb": self.args.rollout_eval_min_free_mb,
+                            "timeout_seconds": self.args.rollout_eval_timeout_seconds,
+                            "epoch": epoch,
+                            "iteration": iteration,
+                            "global_step": global_step,
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                self.logger.warning("rollout eval skipped after waiting for GPU memory timeout; status written to %s", out_dir)
+                return
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CHECKPOINT_PATH": checkpoint_path,
+                    "OUT_DIR": out_dir,
+                    "EXP_NAME": eval_name,
+                    "RUN_LABEL": eval_name,
+                    "WITH_TRANSITION_TOKENS": str(bool(self.args.with_transition_tokens)).lower(),
+                    "SAMPLES": str(self.args.rollout_eval_samples),
+                    "FUTURE_FRAMES": str(self.args.rollout_eval_future_frames),
+                    "PREVIEW_SAMPLES": str(self.args.rollout_eval_preview_samples),
+                    "SAVE_GIF": "true",
+                    "ROLLOUT_STATE": self.args.rollout_eval_state,
+                }
+            )
+
+            if self.args.rollout_eval_num_gpus > 1:
+                script = "./eval_bair_rollout_multi.sh"
+                env["GPU_IDS"] = ",".join(gpu_ids[: self.args.rollout_eval_num_gpus])
+                env["SHARD_COUNT"] = str(self.args.rollout_eval_num_gpus)
+            else:
+                script = "./eval_bair_rollout.sh"
+                env["CUDA_VISIBLE_DEVICES"] = gpu_ids[0]
+
+            self.logger.info("start rollout eval: checkpoint=%s out_dir=%s", checkpoint_path, out_dir)
+            result = subprocess.run(["bash", script], cwd=workdir, env=env, check=False)
+            if result.returncode != 0:
+                self.logger.warning("rollout eval failed with returncode=%s for %s", result.returncode, checkpoint_path)
+            else:
+                self.logger.info("finished rollout eval: %s", out_dir)
+        finally:
+            dist.barrier()
+
+    def _run_eval_pair_awm_w(self, *, epoch, iteration=None, global_step=None, max_batches=None):
+        self.start_iter = 0
+        self.metric_logger_to_resume = None
+
+        val_stats_ind = self.val_one_epoch_awm_ind_w(
+            epoch,
+            self.start_iter,
+            log_writer=self.log_writer,
+            metric_logger=None,
+            max_batches=max_batches,
+        )
+        if self.global_rank == 0 and self.log_writer is not None:
+            self.log_writer.flush()
+        self._append_flat_log(
+            "log_eval_ind.txt",
+            val_stats_ind,
+            epoch=epoch,
+            iteration=iteration,
+            global_step=global_step,
+            prefix="val",
+        )
+        self._write_metric_record(
+            phase="eval",
+            split="ind",
+            metrics=val_stats_ind,
+            epoch=epoch,
+            iteration=iteration,
+            global_step=global_step,
+        )
+
+        val_stats_ood = self.val_one_epoch_awm_ood_w(
+            epoch,
+            self.start_iter,
+            log_writer=self.log_writer,
+            metric_logger=None,
+            max_batches=max_batches,
+        )
+        if self.global_rank == 0 and self.log_writer is not None:
+            self.log_writer.flush()
+        self._append_flat_log(
+            "log_eval_ood.txt",
+            val_stats_ood,
+            epoch=epoch,
+            iteration=iteration,
+            global_step=global_step,
+            prefix="val",
+        )
+        self._write_metric_record(
+            phase="eval",
+            split="ood",
+            metrics=val_stats_ood,
+            epoch=epoch,
+            iteration=iteration,
+            global_step=global_step,
+        )
+        self.model.train(True)
+        return {"ind": val_stats_ind, "ood": val_stats_ood}
+
     @classmethod
     def get_args_parser(cls):
         parser = argparse.ArgumentParser("xllmx Finetuning", add_help=False)
@@ -214,7 +653,7 @@ class PretrainSolverBase_ck_action_head(ABC):
         parser.add_argument("--data_config_train", default="/path/to/data/config/yaml", type=str, help="data config path")
         parser.add_argument("--data_config_val_ind", default="/path/to/data/config/yaml", type=str, help="data config path")
         parser.add_argument("--data_config_val_ood", default="/path/to/data/config/yaml", type=str, help="data config path")
-        parser.add_argument("--train_only", default=False, type=bool, help="eval or not during training")
+        parser.add_argument("--train_only", default=False, type=str2bool, help="skip eval during training")
         parser.add_argument(
             "--cache_ann_on_disk",
             action="store_true",
@@ -249,14 +688,107 @@ class PretrainSolverBase_ck_action_head(ABC):
             help="number of iterations between within-epoch model saving",
         )
         parser.add_argument(
+            "--eval_iteration_interval",
+            default=0,
+            type=int,
+            help="number of optimizer updates between validation runs, <=0 disables step eval",
+        )
+        parser.add_argument(
+            "--eval_max_batches",
+            default=0,
+            type=int,
+            help="maximum batches per validation split, <=0 evaluates the full split",
+        )
+        parser.add_argument(
+            "--max_train_steps",
+            default=0,
+            type=int,
+            help="maximum optimizer updates to run, <=0 means no step cap",
+        )
+        parser.add_argument(
+            "--eval_at_start",
+            action="store_true",
+            help="run validation before the first training update",
+        )
+        parser.add_argument(
+            "--no_eval_at_epoch_end",
+            action="store_false",
+            dest="eval_at_epoch_end",
+            help="disable validation after each epoch",
+        )
+        parser.set_defaults(eval_at_epoch_end=True)
+        parser.add_argument(
+            "--no_save_at_epoch_end",
+            action="store_false",
+            dest="save_at_epoch_end",
+            help="disable checkpoint saving after each epoch; useful for short memory smoke runs",
+        )
+        parser.set_defaults(save_at_epoch_end=True)
+        parser.add_argument(
+            "--metrics_dir",
+            default=None,
+            type=str,
+            help="directory for grouped metrics json/jsonl, defaults to output_dir/metrics",
+        )
+        parser.add_argument(
+            "--log_metrics_interval",
+            default=50,
+            type=int,
+            help="number of optimizer updates between grouped train-step metric records",
+        )
+        parser.add_argument(
+            "--rollout_eval_iteration_interval",
+            default=0,
+            type=int,
+            help="number of optimizer updates between open-loop rollout eval runs, <=0 disables it",
+        )
+        parser.add_argument("--rollout_eval_workdir", default="", type=str, help="directory containing rollout eval scripts")
+        parser.add_argument("--rollout_eval_gpu_ids", default="", type=str, help="physical GPU ids for rollout eval")
+        parser.add_argument("--rollout_eval_num_gpus", default=1, type=int, help="number of GPUs for sharded rollout eval")
+        parser.add_argument("--rollout_eval_samples", default=8, type=int, help="number of clips for periodic rollout eval")
+        parser.add_argument("--rollout_eval_future_frames", default=15, type=int, help="future frames for periodic rollout eval")
+        parser.add_argument("--rollout_eval_preview_samples", default=4, type=int, help="GIF/grid clips for periodic rollout eval")
+        parser.add_argument("--rollout_eval_min_free_mb", default=0, type=int, help="wait until rollout GPUs have this much free memory")
+        parser.add_argument("--rollout_eval_poll_seconds", default=30, type=int, help="poll interval while waiting for rollout GPU memory")
+        parser.add_argument("--rollout_eval_timeout_seconds", default=0, type=int, help="max seconds to wait for rollout GPUs, <=0 means wait forever")
+        parser.add_argument("--rollout_eval_state", default="token", choices=["token", "image"], help="rollout state passed to eval_bair_rollout.py")
+        parser.add_argument(
             "--only_save_trainable", default=False, action="store_true", help="only save trainable model parameters"
         )
         parser.add_argument(
             "--ckpt_max_keep", default=2, type=int, help="maximum number of checkpoints to keep, <=0 means keep all"
         )
+        parser.add_argument("--best_checkpoint_metric", default="closs", type=str, help="eval metric used to update output_dir/best; empty disables best checkpoint tracking")
+        parser.add_argument("--best_checkpoint_split", default="ind", choices=["ind", "ood"], help="eval split used for best checkpoint tracking")
+        parser.add_argument("--best_checkpoint_mode", default="min", choices=["min", "max"], help="whether lower or higher best_checkpoint_metric is better")
+        parser.add_argument("--best_checkpoint_dir", default="best", type=str, help="directory name under output_dir for the best checkpoint copy")
         parser.add_argument("--auto_resume", default=True, help="auto resume from args.output_dir")
         parser.add_argument("--no_auto_resume", action="store_false", dest="auto_resume")
         parser.add_argument("--resume_path", default=None, type=str, help="manually specify resume checkpoint")
+        parser.add_argument(
+            "--no_promote_params_to_fp32",
+            action="store_false",
+            dest="promote_params_to_fp32",
+            help="keep model parameters in their loaded dtype before FSDP wrapping; lowers optimizer-state memory",
+        )
+        parser.set_defaults(promote_params_to_fp32=True)
+        parser.add_argument(
+            "--load_model_on_all_ranks",
+            action="store_true",
+            help=(
+                "load the checkpoint on every data-parallel rank before FSDP wrapping. "
+                "This uses more CPU RAM/IO but avoids rank0-only meta init and sync_module_states, "
+                "which can be unstable for partial fine-tuning."
+            ),
+        )
+        parser.add_argument(
+            "--ignore_mismatched_checkpoint_sizes",
+            action="store_true",
+            help=(
+                "allow from_pretrained to skip checkpoint tensors whose shapes differ from the current config; "
+                "useful when adapting an official action-world-model checkpoint to a dataset with a different action_dim"
+            ),
+        )
 
         # Parallel
         parser.add_argument("--model_parallel_size", type=int, default=1)
@@ -268,23 +800,39 @@ class PretrainSolverBase_ck_action_head(ABC):
         parser.add_argument("--checkpointing", action="store_true", default=False, help="enable gradient checkpointing")
         # parser.add_argument('--quant', action="store_true", default=False,  # todo
         #                     help="enable quantization to speedup and save memory")
-        parser.add_argument("--eval_only", type=bool, default=False, help="enable gradient checkpointing")
-        parser.add_argument("--ft", type=bool, default=False, help="fintune from the pretrained model or not")
+        parser.add_argument("--eval_only", type=str2bool, default=False, help="run validation only")
+        parser.add_argument("--ft", type=str2bool, default=False, help="fintune from the pretrained model or not")
         parser.add_argument("--ablation", type=str, choices=["0", "1", "2", "3", "4", "5"], default="fp32")
         parser.add_argument("--loss_ct_weights", type=int, default=10)
         parser.add_argument("--loss_img_weights", type=float, default=0.04)
         parser.add_argument(
+            "--disable_custom_att_mask",
+            action="store_true",
+            help="use the backbone causal mask instead of the action/image custom attention mask",
+        )
+        parser.add_argument(
             "--trainable-scope",
             default="all",
-            choices=["all", "transition_only"],
-            help="which parameters to train; transition_only keeps the Chameleon backbone frozen",
+            choices=["all", "transition_only", "last_layers"],
+            help="which parameters to train; last_layers trains embeddings, final N layers, norm, lm_head, action_head",
+        )
+        parser.add_argument(
+            "--train-last-n-layers",
+            default=4,
+            type=int,
+            help="number of final Chameleon decoder layers to train when trainable_scope=last_layers",
         )
 
 
         return parser
 
     def build_model(self) -> (nn.Module, Tokenizer):
-        init_from = self.args.resume_path or self.args.init_from
+        resume_trainable_path = None
+        if self.args.resume_path and (Path(self.args.resume_path) / "trainable_params.pt").exists():
+            init_from = self.args.init_from
+            resume_trainable_path = Path(self.args.resume_path) / "trainable_params.pt"
+        else:
+            init_from = self.args.resume_path or self.args.init_from
         if init_from is None:
             # starting_point_path = Path(self.args.output_dir) / "starting_point"
             starting_point_path = Path('../ckpts') / 'starting_point'
@@ -311,8 +859,25 @@ class PretrainSolverBase_ck_action_head(ABC):
 
         self.logger.info(f"Start instantiating unwrapped model from {init_from}")
 
-        # only rank 0 instantiate, otherwise to meta
+        # only rank 0 instantiate by default, otherwise to meta
         unwrapped_model, tokenizer = self._model_func(init_from)
+        if resume_trainable_path is not None and (
+            self.dp_rank == 0 or getattr(self.args, "load_model_on_all_ranks", False)
+        ):
+            trainable_state = torch.load(resume_trainable_path, map_location="cpu")
+            incompatible = unwrapped_model.load_state_dict(trainable_state, strict=False)
+            unexpected = list(incompatible.unexpected_keys)
+            missing_trainable = [
+                key
+                for key, param in unwrapped_model.named_parameters()
+                if key.startswith("transition_token_adapter.") and key in incompatible.missing_keys
+            ]
+            if unexpected or missing_trainable:
+                raise RuntimeError(
+                    f"failed to load trainable checkpoint {resume_trainable_path}: "
+                    f"unexpected={unexpected}, missing_trainable={missing_trainable}"
+                )
+            self.logger.info(f"Loaded trainable parameters from {resume_trainable_path}")
         trainable_scope = getattr(self.args, "trainable_scope", "all")
         if trainable_scope == "transition_only":
             found_trainable = False
@@ -325,15 +890,50 @@ class PretrainSolverBase_ck_action_head(ABC):
             if not found_trainable:
                 raise ValueError("trainable_scope=transition_only but model has no transition_token_adapter params")
             self.logger.info("Trainable scope: transition_token_adapter only; backbone parameters stay frozen.")
+        elif trainable_scope == "last_layers":
+            n_layers = len(getattr(unwrapped_model.model, "layers", []))
+            train_last_n = max(0, min(int(getattr(self.args, "train_last_n_layers", 4)), n_layers))
+            first_trainable_layer = n_layers - train_last_n
+            found_trainable = False
+
+            def layer_index(name: str) -> int | None:
+                parts = name.split(".")
+                if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers" and parts[2].isdigit():
+                    return int(parts[2])
+                return None
+
+            for key, param in unwrapped_model.named_parameters():
+                idx = layer_index(key)
+                is_trainable = (
+                    key.startswith("model.embed_tokens.")
+                    or key.startswith("model.norm.")
+                    or key.startswith("lm_head.")
+                    or key.startswith("action_head.")
+                    or (idx is not None and idx >= first_trainable_layer)
+                )
+                param.requires_grad = is_trainable
+                if is_trainable:
+                    found_trainable = True
+                    if self.args.promote_params_to_fp32:
+                        promote_param_to_fp32(param)
+            if not found_trainable:
+                raise ValueError("trainable_scope=last_layers did not select any parameters")
+            self.logger.info(
+                "Trainable scope: embed_tokens + final %d/%d decoder layers + norm + lm_head + action_head.",
+                train_last_n,
+                n_layers,
+            )
         elif hasattr(unwrapped_model, "get_trainable_params"):
             trainable_params = dict(unwrapped_model.get_trainable_params())
             for key, param in unwrapped_model.named_parameters():
                 if key in trainable_params or 'lora' in key:
                     param.requires_grad = True
-                    promote_param_to_fp32(param)
+                    if self.args.promote_params_to_fp32:
+                        promote_param_to_fp32(param)
                 else:
                     param.requires_grad = False
-                    promote_param_to_fp32(param)
+                    if self.args.promote_params_to_fp32:
+                        promote_param_to_fp32(param)
                     # keep_fp32_keywords = ["norm", "lm_head", "embed_tokens"]
                     # if any([_ in key for _ in keep_fp32_keywords]):
                     #     promote_param_to_fp32(param)
@@ -347,7 +947,8 @@ class PretrainSolverBase_ck_action_head(ABC):
             for key, param in unwrapped_model.named_parameters():
                 param.requires_grad = True
                 param.requires_grad = True
-                promote_param_to_fp32(param)
+                if self.args.promote_params_to_fp32:
+                    promote_param_to_fp32(param)
 
         self.logger.info("Finish instantiating unwrapped model.")
         self.logger.info(f"Unwrapped model: \n{str(unwrapped_model)}")
@@ -419,7 +1020,10 @@ class PretrainSolverBase_ck_action_head(ABC):
         self.logger.info(f"Wrapped model: \n{str(model)}")
 
         # Setup optimizer
-        opt = torch.optim.AdamW(model.parameters(), lr=self.args.lr, weight_decay=self.args.wd, betas=(0.9, 0.95))
+        trainable_parameters = [param for param in model.parameters() if param.requires_grad]
+        if not trainable_parameters:
+            raise ValueError("no trainable parameters found for optimizer")
+        opt = torch.optim.AdamW(trainable_parameters, lr=self.args.lr, weight_decay=self.args.wd, betas=(0.9, 0.95))
 
         return model, tokenizer, opt
 
@@ -433,10 +1037,16 @@ class PretrainSolverBase_ck_action_head(ABC):
 
     def setup_fsdp_sync(self, model: nn.Module, data_parallel: str, precision: str, grad_precision: Optional[str]) -> FSDP:
 
-        if self.dp_rank == 0:
+        load_model_on_all_ranks = getattr(self.args, "load_model_on_all_ranks", False)
+        if self.dp_rank == 0 or load_model_on_all_ranks:
             param_init_fn = None
         else:
             param_init_fn = lambda x: x.to_empty(device=torch.cuda.current_device(), recurse=False)
+        self.logger.info(
+            "FSDP setup: load_model_on_all_ranks=%s, sync_module_states=%s",
+            load_model_on_all_ranks,
+            not load_model_on_all_ranks,
+        )
         
         model = FSDP(
             model,
@@ -464,13 +1074,14 @@ class PretrainSolverBase_ck_action_head(ABC):
                 }[grad_precision or precision],
             ),
             device_id=torch.cuda.current_device(),
-            sync_module_states=True,
+            sync_module_states=not load_model_on_all_ranks,
             limit_all_gathers=True,
             use_orig_params=True,
             param_init_fn=param_init_fn
 
         )
         torch.cuda.synchronize()
+        dist.barrier(group=fs_init.get_data_parallel_group())
 
         return model
 
@@ -723,7 +1334,9 @@ class PretrainSolverBase_ck_action_head(ABC):
                 metric_logger=self.metric_logger_to_resume,
             )
 
-            if epoch % self.args.save_interval == 0 or epoch + 1 == self.args.epochs:
+            if self.args.save_at_epoch_end and (
+                epoch % self.args.save_interval == 0 or epoch + 1 == self.args.epochs
+            ):
                 util.ckpt.save(
                     self.args.output_dir,
                     self.global_rank == 0,
@@ -785,8 +1398,30 @@ class PretrainSolverBase_ck_action_head(ABC):
         self.logger.info("Training time {}".format(total_time_str))
     
     def run_with_eval_awm_w(self):
+        eval_max_batches = self.args.eval_max_batches if self.args.eval_max_batches > 0 else None
+        if self.args.eval_only:
+            self.logger.info("Run eval_only on validation splits")
+            self._run_eval_pair_awm_w(
+                epoch=self.start_epoch,
+                iteration=self.start_iter,
+                global_step=None,
+                max_batches=eval_max_batches,
+            )
+            return
+
         self.logger.info(f"Start training for {self.args.epochs} epochs")
         start_time = time.time()
+        self._train_started_at = start_time
+        self._stop_training = False
+
+        if self.args.eval_at_start and not self.args.train_only:
+            self._run_eval_pair_awm_w(
+                epoch=self.start_epoch,
+                iteration=self.start_iter,
+                global_step=0,
+                max_batches=eval_max_batches,
+            )
+
         for epoch in range(self.start_epoch, self.args.epochs):
             self.dataloader_train.sampler.set_epoch(epoch, self.start_iter)  # todo rename set_epoch
 
@@ -797,67 +1432,41 @@ class PretrainSolverBase_ck_action_head(ABC):
                 metric_logger=self.metric_logger_to_resume,
             )
 
-            if epoch % self.args.save_interval == 0 or epoch + 1 == self.args.epochs:
-                util.ckpt.save(
-                    self.args.output_dir,
-                    self.global_rank == 0,
-                    self.model,
-                    self.optimizer,
-                    self.tokenizer,
-                    self.args,
-                    epoch=epoch,
-                    max_keep=self.args.ckpt_max_keep,
-                )
+            if self.args.save_at_epoch_end and (
+                epoch % self.args.save_interval == 0 or epoch + 1 == self.args.epochs
+            ):
+                self._save_checkpoint(epoch=epoch)
                 
-
-            log_stats = {**{f"train_{k}": v for k, v in train_stats.items()}, "epoch": epoch}
 
             if self.global_rank == 0:
                 if self.log_writer is not None:
                     self.log_writer.flush()
-                with open(os.path.join(self.args.output_dir, "log_train.txt"), mode="a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_stats) + "\n")
+            self._append_flat_log("log_train.txt", train_stats, epoch=epoch, prefix="train")
+            self._write_metric_record(
+                phase="train",
+                split="train",
+                metrics=train_stats,
+                epoch=epoch,
+                global_step=getattr(self, "_last_global_step", None),
+            )
             
             self.start_iter = 0
 
             if self.args.train_only:
+                if getattr(self, "_stop_training", False):
+                    break
                 continue
 
-            self.start_iter = 0
-            self.metric_logger_to_resume = None
-            
-            val_stats_ind = self.val_one_epoch_awm_ind_w(
-                epoch,
-                self.start_iter,
-                log_writer=self.log_writer,
-                metric_logger=self.metric_logger_to_resume,
-            )
+            if self.args.eval_at_epoch_end:
+                self._run_eval_pair_awm_w(
+                    epoch=epoch,
+                    iteration=None,
+                    global_step=getattr(self, "_last_global_step", None),
+                    max_batches=eval_max_batches,
+                )
 
-            log_stats = {**{f"val_{k}": v for k, v in val_stats_ind.items()}, "epoch": epoch}
-            
-            if self.global_rank == 0:
-                if self.log_writer is not None:
-                    self.log_writer.flush()
-                with open(os.path.join(self.args.output_dir, "log_eval_ind.txt"), mode="a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-            
-            self.start_iter = 0
-            self.metric_logger_to_resume = None
-            
-            val_stats_ood = self.val_one_epoch_awm_ood_w(
-                epoch,
-                self.start_iter,
-                log_writer=self.log_writer,
-                metric_logger=self.metric_logger_to_resume,
-            )
-
-            log_stats = {**{f"val_{k}": v for k, v in val_stats_ood.items()}, "epoch": epoch}
-
-            if self.global_rank == 0:
-                if self.log_writer is not None:
-                    self.log_writer.flush()
-                with open(os.path.join(self.args.output_dir, "log_eval_ood.txt"), mode="a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_stats) + "\n")
+            if getattr(self, "_stop_training", False):
+                break
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -966,7 +1575,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[self.args.precision]:
-                c_loss, additional_loss_dict, logits, hidden_states, labels_c, predicted_actions, loss_ct  = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, att_mask=True)
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c, predicted_actions, loss_ct  = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, att_mask=not self.args.disable_custom_att_mask)
             if loss_ct == 0:
                 continue
             # print('-----------------', self.args.loss_ct_weights)
@@ -1001,6 +1610,10 @@ class PretrainSolverBase_ck_action_head(ABC):
             
             if is_gradient_accumulation_boundary:
                 grad_norm = self.model.clip_grad_norm_(max_norm=self.args.clip_grad)
+                if not math.isfinite(float(grad_norm)):
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.logger.error("Gradient norm is {}, stopping training".format(float(grad_norm)))
+                    sys.exit(1)
                 metric_logger.update(grad_norm=grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -1068,12 +1681,19 @@ class PretrainSolverBase_ck_action_head(ABC):
         accum_iter = self.args.accum_iter
         accum_counter = 0
 
-        loss_weights = torch.ones(65536)
+        loss_weights = torch.ones(65536, device=self.model.device)
         # loss_weights[3:8195] = 0.04
         print('------------self.args.loss_img_weights', self.args.loss_img_weights)
         loss_weights[3:8195] = self.args.loss_img_weights
 
         self.optimizer.zero_grad()
+        num_updates_per_epoch = max(1, math.ceil(len(self.dataloader_train) / accum_iter))
+        self._estimated_total_train_steps = (
+            self.args.max_train_steps if self.args.max_train_steps > 0 else self.args.epochs * num_updates_per_epoch
+        )
+        if not hasattr(self, "_run_start_global_step"):
+            self._run_start_global_step = epoch * num_updates_per_epoch + start_iter // accum_iter
+        eval_max_batches = self.args.eval_max_batches if self.args.eval_max_batches > 0 else None
         for data_iter_step, batch_data in enumerate(
             metric_logger.log_every(
                 self.dataloader_train,
@@ -1128,7 +1748,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[self.args.precision]:
-                c_loss, additional_loss_dict, logits, hidden_states, labels_c, predicted_actions, loss_ct  = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, loss_weights=loss_weights, att_mask=True)
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c, predicted_actions, loss_ct  = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, loss_weights=loss_weights, att_mask=not self.args.disable_custom_att_mask)
 
             # if loss_ct == 0:
             #     print('2222222222222', c_loss, loss_ct)
@@ -1164,6 +1784,10 @@ class PretrainSolverBase_ck_action_head(ABC):
 
             if is_gradient_accumulation_boundary:
                 grad_norm = self.model.clip_grad_norm_(max_norm=self.args.clip_grad)
+                if not math.isfinite(float(grad_norm)):
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.logger.error("Gradient norm is {}, stopping training".format(float(grad_norm)))
+                    sys.exit(1)
                 metric_logger.update(grad_norm=grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -1185,25 +1809,82 @@ class PretrainSolverBase_ck_action_head(ABC):
                             'train_' + metric_name, metric_value, data_iter_step + len(self.dataloader_train) * epoch
                         )
 
-            # save within epoch
-            n_update_per_save = self.args.save_iteration_interval // accum_iter
-            if (
-                is_gradient_accumulation_boundary and ((data_iter_step + 1) // accum_iter) % n_update_per_save == 0
-            ) or (data_iter_step + 1 == accum_iter and epoch == 0):
-                util.ckpt.save(
-                    self.args.output_dir,
-                    self.global_rank == 0,
-                    self.model,
-                    self.optimizer,
-                    self.tokenizer,
-                    self.args,
-                    epoch=epoch,
-                    iteration=data_iter_step,
-                    additional_rank_specific={
-                        "metric_logger": metric_logger,
-                    },
-                    max_keep=self.args.ckpt_max_keep,
-                )
+            if is_gradient_accumulation_boundary:
+                update_in_epoch = (data_iter_step + 1) // accum_iter
+                global_step = epoch * num_updates_per_epoch + update_in_epoch
+                self._last_global_step = global_step
+                checkpoint_saved_this_step = False
+
+                if self.global_rank == 0 and global_step % max(1, self.args.log_metrics_interval) == 0:
+                    current_stats = {key: meter.value for key, meter in metric_logger.meters.items()}
+                    if torch.cuda.is_available():
+                        mb = 1024 ** 2
+                        current_stats.update(
+                            {
+                                "cuda_allocated_memory_mb": torch.cuda.memory_allocated() / mb,
+                                "cuda_reserved_memory_mb": torch.cuda.memory_reserved() / mb,
+                                "cuda_max_allocated_memory_mb": torch.cuda.max_memory_allocated() / mb,
+                                "cuda_max_reserved_memory_mb": torch.cuda.max_memory_reserved() / mb,
+                            }
+                        )
+                    self._write_metric_record(
+                        phase="train",
+                        split="train_step",
+                        metrics=current_stats,
+                        epoch=epoch,
+                        iteration=data_iter_step,
+                        global_step=global_step,
+                    )
+
+                if self.args.save_iteration_interval > 0 and global_step % self.args.save_iteration_interval == 0:
+                    self.metric_logger_to_resume = metric_logger
+                    self._save_checkpoint(epoch=epoch, iteration=data_iter_step)
+                    self.metric_logger_to_resume = None
+                    checkpoint_saved_this_step = True
+
+                if (
+                    self.args.rollout_eval_iteration_interval > 0
+                    and global_step % self.args.rollout_eval_iteration_interval == 0
+                ):
+                    if not checkpoint_saved_this_step:
+                        self.metric_logger_to_resume = metric_logger
+                        self._save_checkpoint(epoch=epoch, iteration=data_iter_step)
+                        self.metric_logger_to_resume = None
+                        checkpoint_saved_this_step = True
+                    self._run_rollout_eval_for_checkpoint(
+                        epoch=epoch,
+                        iteration=data_iter_step,
+                        global_step=global_step,
+                    )
+
+                if (
+                    self.args.eval_iteration_interval > 0
+                    and not self.args.train_only
+                    and global_step % self.args.eval_iteration_interval == 0
+                ):
+                    if not checkpoint_saved_this_step:
+                        self.metric_logger_to_resume = metric_logger
+                        self._save_checkpoint(epoch=epoch, iteration=data_iter_step)
+                        self.metric_logger_to_resume = None
+                        checkpoint_saved_this_step = True
+                    eval_stats = self._run_eval_pair_awm_w(
+                        epoch=epoch,
+                        iteration=data_iter_step,
+                        global_step=global_step,
+                        max_batches=eval_max_batches,
+                    )
+                    self._maybe_update_best_checkpoint(
+                        eval_stats=eval_stats,
+                        checkpoint_path=self._rollout_checkpoint_path(epoch=epoch, iteration=data_iter_step),
+                        epoch=epoch,
+                        iteration=data_iter_step,
+                        global_step=global_step,
+                    )
+
+                if self.args.max_train_steps > 0 and global_step >= self.args.max_train_steps:
+                    self.logger.info(f"Reached max_train_steps={self.args.max_train_steps}; stopping training")
+                    self._stop_training = True
+                    break
                 
             # break
 
@@ -1361,7 +2042,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[self.args.precision]:
-                c_loss, additional_loss_dict, logits, hidden_states, labels_c = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, att_mask=True)            
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, att_mask=not self.args.disable_custom_att_mask)
             loss = c_loss
             for add_loss, weight in additional_loss_dict.values():
                 loss = loss + add_loss * weight
@@ -1412,6 +2093,7 @@ class PretrainSolverBase_ck_action_head(ABC):
         start_iter: int,
         log_writer=None,
         metric_logger=None,
+        max_batches=None,
     ):
         # self.model.train(False)
         self.model.eval()
@@ -1422,9 +2104,10 @@ class PretrainSolverBase_ck_action_head(ABC):
         header = "Epoch: [{}]".format(epoch)
         print_freq = 10  # todo arg
 
-        loss_weights = torch.ones(65536)
-        loss_weights[3:8195] = 0.04
+        loss_weights = torch.ones(65536, device=self.model.device)
+        loss_weights[3:8195] = self.args.loss_img_weights
 
+        processed_batches = 0
         for data_iter_step, batch_data in enumerate(
             metric_logger.log_every(
                 self.dataloader_val_ind,
@@ -1435,6 +2118,9 @@ class PretrainSolverBase_ck_action_head(ABC):
             ),
             start=start_iter,
         ):
+            if max_batches is not None and processed_batches >= max_batches:
+                break
+            processed_batches += 1
 
             if len(batch_data)==2:
                 examples, labels = batch_data
@@ -1467,24 +2153,29 @@ class PretrainSolverBase_ck_action_head(ABC):
                         labels.append(labels_)
                         
 
-            with {
-                "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
-                "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
-                "fp32": contextlib.nullcontext(),
-                "tf32": contextlib.nullcontext(),
-            }[self.args.precision]:
-                c_loss, additional_loss_dict, logits, hidden_states, labels_c = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, loss_weights=loss_weights, att_mask=True)            
-            loss = c_loss
+            with torch.no_grad():
+                with {
+                    "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
+                    "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
+                    "fp32": contextlib.nullcontext(),
+                    "tf32": contextlib.nullcontext(),
+                }[self.args.precision]:
+                    model_out = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, loss_weights=loss_weights, att_mask=not self.args.disable_custom_att_mask)
+            if len(model_out) == 7:
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c, predicted_actions, loss_ct = model_out
+            else:
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c = model_out
+                loss_ct = c_loss.new_tensor(0.0)
+            loss = c_loss + self.args.loss_ct_weights * loss_ct
             for add_loss, weight in additional_loss_dict.values():
                 loss = loss + add_loss * weight
             loss_value = loss.item()
             c_loss_value = c_loss.item()
+            loss_ct_value = loss_ct.item()
             if not math.isfinite(loss_value):
                 self.logger.error("Loss is {}, stopping training".format(loss_value))
                 sys.exit(1)
 
-            grad_norm = self.model.clip_grad_norm_(max_norm=self.args.clip_grad)
-            metric_logger.update(grad_norm=grad_norm)
             torch.cuda.synchronize()
             
             # if self.global_rank == 0:
@@ -1500,6 +2191,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                 metric_logger.update(**{f"acc_image_{i}": accuracies_image[i]})
 
             metric_logger.update(closs=c_loss_value)
+            metric_logger.update(loss_ct=loss_ct_value)
             metric_logger.update(**{key: val[0].item() for key, val in additional_loss_dict.items()})
             lr = self.optimizer.param_groups[0]["lr"]
             metric_logger.update(lr=lr)
@@ -1510,7 +2202,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                     # metric_value = util.dist.all_reduce_mean(metric_value)
                     if log_writer is not None:
                         log_writer.add_scalar(
-                            'train_' + metric_name, metric_value, data_iter_step + len(self.dataloader_train) * epoch
+                            'val_ind_' + metric_name, metric_value, data_iter_step + len(self.dataloader_val_ind) * epoch
                         )
 
         # gather the stats from all processes
@@ -1583,7 +2275,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                 "fp32": contextlib.nullcontext(),
                 "tf32": contextlib.nullcontext(),
             }[self.args.precision]:
-                c_loss, additional_loss_dict, logits, hidden_states, labels_c = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, att_mask=True)
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, att_mask=not self.args.disable_custom_att_mask)
             loss = c_loss
             for add_loss, weight in additional_loss_dict.values():
                 loss = loss + add_loss * weight
@@ -1634,6 +2326,7 @@ class PretrainSolverBase_ck_action_head(ABC):
         start_iter: int,
         log_writer=None,
         metric_logger=None,
+        max_batches=None,
     ):
         # self.model.train(False)
         self.model.eval()
@@ -1644,9 +2337,10 @@ class PretrainSolverBase_ck_action_head(ABC):
         header = "Epoch: [{}]".format(epoch)
         print_freq = 10  # todo arg
 
-        loss_weights = torch.ones(65536)
-        loss_weights[3:8195] = 0.04
+        loss_weights = torch.ones(65536, device=self.model.device)
+        loss_weights[3:8195] = self.args.loss_img_weights
 
+        processed_batches = 0
         for data_iter_step, batch_data in enumerate(
             metric_logger.log_every(
                 self.dataloader_val_ood,
@@ -1657,6 +2351,9 @@ class PretrainSolverBase_ck_action_head(ABC):
             ),
             start=start_iter,
         ):
+            if max_batches is not None and processed_batches >= max_batches:
+                break
+            processed_batches += 1
 
             if len(batch_data)==2:
                 examples, labels = batch_data
@@ -1689,24 +2386,29 @@ class PretrainSolverBase_ck_action_head(ABC):
                         labels.append(labels_)
                         
 
-            with {
-                "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
-                "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
-                "fp32": contextlib.nullcontext(),
-                "tf32": contextlib.nullcontext(),
-            }[self.args.precision]:
-                c_loss, additional_loss_dict, logits, hidden_states, labels_c = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, loss_weights=loss_weights, att_mask=True)
-            loss = c_loss
+            with torch.no_grad():
+                with {
+                    "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
+                    "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
+                    "fp32": contextlib.nullcontext(),
+                    "tf32": contextlib.nullcontext(),
+                }[self.args.precision]:
+                    model_out = self.model(input_ids=examples, labels=labels, output_hidden_states=True, training=True, loss_weights=loss_weights, att_mask=not self.args.disable_custom_att_mask)
+            if len(model_out) == 7:
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c, predicted_actions, loss_ct = model_out
+            else:
+                c_loss, additional_loss_dict, logits, hidden_states, labels_c = model_out
+                loss_ct = c_loss.new_tensor(0.0)
+            loss = c_loss + self.args.loss_ct_weights * loss_ct
             for add_loss, weight in additional_loss_dict.values():
                 loss = loss + add_loss * weight
             loss_value = loss.item()
             c_loss_value = c_loss.item()
+            loss_ct_value = loss_ct.item()
             if not math.isfinite(loss_value):
                 self.logger.error("Loss is {}, stopping training".format(loss_value))
                 sys.exit(1)
 
-            grad_norm = self.model.clip_grad_norm_(max_norm=self.args.clip_grad)
-            metric_logger.update(grad_norm=grad_norm)
             torch.cuda.synchronize()
             
             # if self.global_rank == 0:
@@ -1722,6 +2424,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                 metric_logger.update(**{f"acc_image_{i}": accuracies_image[i]})
 
             metric_logger.update(closs=c_loss_value)
+            metric_logger.update(loss_ct=loss_ct_value)
             metric_logger.update(**{key: val[0].item() for key, val in additional_loss_dict.items()})
             lr = self.optimizer.param_groups[0]["lr"]
             metric_logger.update(lr=lr)
@@ -1732,7 +2435,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                     # metric_value = util.dist.all_reduce_mean(metric_value)
                     if log_writer is not None:
                         log_writer.add_scalar(
-                            'train_' + metric_name, metric_value, data_iter_step + len(self.dataloader_train) * epoch
+                            'val_ood_' + metric_name, metric_value, data_iter_step + len(self.dataloader_val_ood) * epoch
                         )
 
         # gather the stats from all processes

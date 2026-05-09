@@ -86,8 +86,11 @@ class TransitionTokenAdapter(nn.Module):
             nn.SiLU(),
             nn.Linear(inner_dim, hidden_size),
         )
-        self.position = nn.Parameter(torch.zeros(max(self.token_count, 1), hidden_size))
-        nn.init.normal_(self.position, std=0.02)
+        self.register_buffer("position", torch.zeros(max(self.token_count, 1), hidden_size), persistent=False)
+
+    def reset_stable_parameters(self):
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> torch.Tensor:
         transition_mask = input_ids == self.token_id
@@ -107,9 +110,12 @@ class TransitionTokenAdapter(nn.Module):
             else:
                 context = inputs_embeds[batch_idx, positions].mean(dim=0)
 
-            base_token = self.net(context)
+            delta_token = self.net(context)
             pos_ids = torch.arange(positions.numel(), device=input_ids.device) % self.position.shape[0]
-            output_embeds[batch_idx, positions] = base_token.unsqueeze(0) + self.position[pos_ids]
+            output_embeds[batch_idx, positions] = (
+                delta_token.unsqueeze(0)
+                + self.position[pos_ids]
+            )
 
         return output_embeds
 
@@ -370,6 +376,7 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
             hidden_mult=config.transition_token_hidden_mult,
         )
         self.post_init()
+        self.transition_token_adapter.reset_stable_parameters()
         
     def _prepare_transition_inputs(self, input_ids, labels=None):
         if input_ids is None or self.config.transition_token_count <= 0:
@@ -687,7 +694,14 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
 
 
     def get_fsdp_wrap_module_list(self) -> List:
-        modules = [*list(self.model.layers), self.lm_head, self.model.embed_tokens, self.action_head, self.transition_token_adapter]
+        modules = [
+            *list(self.model.layers),
+            self.model.norm,
+            self.lm_head,
+            self.model.embed_tokens,
+            self.action_head,
+            self.transition_token_adapter,
+        ]
         if hasattr(self.model, "vqmodel"):  # may be deleted
             modules.append(self.model.vqmodel)
         return modules

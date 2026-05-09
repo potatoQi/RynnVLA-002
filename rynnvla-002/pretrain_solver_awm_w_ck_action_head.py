@@ -1,7 +1,9 @@
 import pickle
+from collections import OrderedDict
 from typing import List, Tuple
 
 from accelerate import init_empty_weights
+import numpy as np
 import torch
 
 from model import ChameleonXLLMXConfig, ChameleonXLLMXForConditionalGeneration_ck_action_head
@@ -10,11 +12,34 @@ from xllmx.solvers.pretrain import PretrainSolverBase_ck_action_head
 
 
 class ItemProcessor(ItemProcessorBase):
+    def __init__(self, max_cached_arrays: int = 16):
+        self.max_cached_arrays = max_cached_arrays
+        self._array_cache = OrderedDict()
+
+    def _load_array(self, path: str):
+        array = self._array_cache.get(path)
+        if array is not None:
+            self._array_cache.move_to_end(path)
+            return array
+
+        array = np.load(path, mmap_mode="r")
+        self._array_cache[path] = array
+        if len(self._array_cache) > self.max_cached_arrays:
+            self._array_cache.popitem(last=False)
+        return array
+
     def process_item(self, data_item: dict, training_mode=False) -> Tuple[List, List]:
         assert training_mode
 
         if "token" in data_item and "label" in data_item:
             data_item = data_item
+        elif "token_file" in data_item and "label_file" in data_item:
+            idx = int(data_item["index"])
+            length = int(data_item["len"])
+            tokens = self._load_array(data_item["token_file"])[idx, :length].astype(np.int64).tolist()
+            labels = self._load_array(data_item["label_file"])[idx, :length].astype(np.int64).tolist()
+            assert len(tokens) == len(labels)
+            return tokens, labels
         else:
             assert "file" in data_item
             with open(data_item["file"], "rb") as f:
@@ -59,18 +84,30 @@ class Solver(PretrainSolverBase_ck_action_head):
         parser.add_argument("--with-transition-tokens", action="store_true")
         parser.add_argument("--transition-token-id", type=int, default=16001)
         parser.add_argument("--transition-token-count", type=int, default=4)
-        parser.add_argument("--transition-token-hidden-mult", type=int, default=4)
+        parser.add_argument("--transition-token-hidden-mult", type=int, default=1)
         return parser
 
     def _model_func(
         self,
         init_from: str,
     ) -> (ChameleonXLLMXForConditionalGeneration_ck_action_head, None):
+        model_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "tf32": torch.float32,
+        }[self.args.precision]
 
-        # Only instantiate the model on rank0
-        # Other ranks will receive the model weights from rank0 during FSDP wrapping (through `sync_module_states`)
-        # See https://github.com/pytorch/pytorch/issues/105840
-        if self.dp_rank == 0:
+        # By default, only rank0 instantiates the model and other ranks receive
+        # weights during FSDP wrapping. For partial fine-tuning, loading on all
+        # ranks avoids large rank-local sync peaks and NCCL ordering issues.
+        if self.dp_rank == 0 or getattr(self.args, "load_model_on_all_ranks", False):
+            load_kwargs = {
+                "torch_dtype": model_dtype,
+                "ignore_mismatched_sizes": self.args.ignore_mismatched_checkpoint_sizes,
+            }
+            if not self.args.ignore_mismatched_checkpoint_sizes:
+                load_kwargs["device_map"] = "cpu"
+
             model = ChameleonXLLMXForConditionalGeneration_ck_action_head.from_pretrained(
                 init_from,
                 action_dim=self.args.action_dim,
@@ -82,9 +119,9 @@ class Solver(PretrainSolverBase_ck_action_head):
                 mask_image_logits=self.args.mask_image_logits,
                 dropout=self.args.dropout,
                 z_loss_weight=self.args.z_loss_weight,
-                torch_dtype=torch.bfloat16,
-                device_map="cpu",
+                **load_kwargs,
             )
+            model.transition_token_adapter.reset_stable_parameters()
         else:
             with init_empty_weights():
                 config = ChameleonXLLMXConfig.from_pretrained(
@@ -98,9 +135,10 @@ class Solver(PretrainSolverBase_ck_action_head):
                     mask_image_logits=self.args.mask_image_logits,
                     dropout=self.args.dropout,
                     z_loss_weight=self.args.z_loss_weight,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=model_dtype,
                 )
                 model = ChameleonXLLMXForConditionalGeneration_ck_action_head(config)
+                model.transition_token_adapter.reset_stable_parameters()
 
         del model.model.vqmodel
 
@@ -131,6 +169,7 @@ class Solver(PretrainSolverBase_ck_action_head):
 
         image_tokens = model.model.vocabulary_mapping.image_tokens
         model.lm_head.weight.data[image_tokens] = torch.zeros_like(model.lm_head.weight.data[image_tokens])
+        model.transition_token_adapter.reset_stable_parameters()
 
         model.save_pretrained(save_path, max_shard_size="10GB")
 

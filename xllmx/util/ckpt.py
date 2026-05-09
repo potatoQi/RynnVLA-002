@@ -64,38 +64,80 @@ def save(
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # save model
-    with FSDP.state_dict_type(
-        model,
-        StateDictType.FULL_STATE_DICT,
-        FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-    ):
-        # run saving in separate functions to save memory
-        def _save_model():
-            save_dtype = {
-                "fp16": torch.float16,
-                "bf16": torch.bfloat16,
-                "tf32": torch.float,
-            }[
-                args.precision
-            ]  # todo make saving precision optional
-            if getattr(args, "only_save_trainable", False):
-                model_trainable_params = model.get_trainable_params()
-                model_trainable_params = [
-                    ".".join([_ for _ in key.split(".") if not _.startswith("_")])
-                    for key in model_trainable_params.keys()
-                ]
-                consolidated_model_state_dict = {
-                    key: val.to(save_dtype) for key, val in model.state_dict().items() if key in model_trainable_params
-                }
-            else:
+    save_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "tf32": torch.float,
+    }[
+        args.precision
+    ]  # todo make saving precision optional
+
+    if getattr(args, "only_save_trainable", False):
+        unwrapped_model = getattr(model, "module", model)
+        trainable_scope = getattr(args, "trainable_scope", "all")
+
+        if trainable_scope != "transition_only" or not hasattr(unwrapped_model, "transition_token_adapter"):
+            raise ValueError(
+                "only_save_trainable currently supports trainable_scope=transition_only "
+                "with a transition_token_adapter module."
+            )
+
+        adapter = unwrapped_model.transition_token_adapter
+        if isinstance(adapter, FSDP):
+            with FSDP.state_dict_type(
+                adapter,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+            ):
+                adapter_state_dict = adapter.state_dict()
+        else:
+            adapter_state_dict = adapter.state_dict() if is_main_process else {}
+
+        if is_main_process:
+            trainable_state_dict = {}
+            for key, val in adapter_state_dict.items():
+                clean_key = key.removeprefix("_fsdp_wrapped_module.")
+                tensor = val.detach().cpu().float()
+                if tensor.numel() == 0:
+                    raise ValueError(f"empty adapter checkpoint tensor: {clean_key}")
+                if not torch.isfinite(tensor).all():
+                    raise FloatingPointError(f"non-finite adapter checkpoint tensor: {clean_key}")
+                max_abs = tensor.abs().max().item()
+                if max_abs > 1e6:
+                    raise FloatingPointError(
+                        f"adapter checkpoint tensor is numerically suspicious: {clean_key} max_abs={max_abs}"
+                    )
+                trainable_state_dict[f"transition_token_adapter.{clean_key}"] = tensor.to(save_dtype)
+            torch.save(trainable_state_dict, os.path.join(save_dir, "trainable_params.pt"))
+            if hasattr(unwrapped_model, "config"):
+                unwrapped_model.config.save_pretrained(save_dir)
+            with open(os.path.join(save_dir, "checkpoint_meta.json"), "w") as f:
+                json.dump(
+                    {
+                        "checkpoint_format": "trainable_params",
+                        "trainable_scope": trainable_scope,
+                        "base_model_path": getattr(args, "init_from", None),
+                    },
+                    f,
+                    indent=2,
+                )
+        logger.info("trainable model parameters saved")
+    else:
+        # save model
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+        ):
+            # run saving in separate functions to save memory
+            def _save_model():
                 consolidated_model_state_dict = {key: val.to(save_dtype) for key, val in model.state_dict().items()}
 
-            if is_main_process:
-                model.save_pretrained(save_dir, state_dict=consolidated_model_state_dict)
+                if is_main_process:
+                    model.save_pretrained(save_dir, state_dict=consolidated_model_state_dict)
 
-        _save_model()
-        logger.info("model saved")
+            _save_model()
+            logger.info("model saved")
 
     # save optimizer
     if optimizer is not None:
@@ -145,5 +187,3 @@ def save(
 
     dist.barrier()
     return
-
-

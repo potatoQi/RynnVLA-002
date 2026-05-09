@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 import pickle
+import zipfile
 from time import sleep
 import traceback
 import warnings
@@ -22,6 +23,21 @@ from PIL import Image
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _npz_array_shape(npz_path, key):
+    """Read an array shape from an .npz member header without loading data."""
+    with zipfile.ZipFile(npz_path) as zf:
+        member = key if key.endswith(".npy") else f"{key}.npy"
+        with zf.open(member) as f:
+            version = np.lib.format.read_magic(f)
+            if version == (1, 0):
+                shape, _, _ = np.lib.format.read_array_header_1_0(f)
+            elif version == (2, 0):
+                shape, _, _ = np.lib.format.read_array_header_2_0(f)
+            else:
+                shape, _, _ = np.lib.format.read_array_header_2_0(f)
+    return shape
 
 
 def parse_simple_value(value):
@@ -344,9 +360,8 @@ class BairRobotPushingConversation(Dataset):
 
     def _build_index(self):
         for file_idx, shard_path in enumerate(self.files):
-            with np.load(shard_path) as shard:
-                frames_shape = shard[self.frames_key].shape
-                actions_shape = shard[self.actions_key].shape
+            frames_shape = _npz_array_shape(shard_path, self.frames_key)
+            actions_shape = _npz_array_shape(shard_path, self.actions_key)
             num_sequences, num_frames = frames_shape[0], frames_shape[1]
             num_actions = actions_shape[1]
             max_start = min(num_frames - 1, num_actions)
