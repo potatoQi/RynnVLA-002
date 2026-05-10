@@ -7,6 +7,7 @@ rynnvla_dir=$(cd "$script_dir/.." && pwd)
 cd "$script_dir"
 export PYTHONPATH="$repo_dir:$rynnvla_dir:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER:-user}}"
 
 checkpoint_path=${CHECKPOINT_PATH:-${1:-../ckpts/starting_point}}
 base_checkpoint_path=${BASE_CHECKPOINT_PATH:-../ckpts/starting_point}
@@ -31,6 +32,9 @@ rollout_state=${ROLLOUT_STATE:-token}
 run_label=${RUN_LABEL:-$exp_name}
 max_shards=${MAX_SHARDS:-0}
 force_image_prefix=${FORCE_IMAGE_PREFIX:-true}
+action_mode=${ACTION_MODE:-gt}
+action_scale=${ACTION_SCALE:-1.0}
+keep_shards=${KEEP_SHARDS:-false}
 
 IFS=',' read -r -a gpus <<< "$gpu_ids"
 shard_count=${SHARD_COUNT:-${#gpus[@]}}
@@ -41,6 +45,10 @@ fi
 if [[ "${#gpus[@]}" -lt "$shard_count" ]]; then
   echo "GPU_IDS has ${#gpus[@]} GPU(s), but SHARD_COUNT=${shard_count}" >&2
   exit 2
+fi
+if [[ "$samples" -lt "$shard_count" ]]; then
+  echo "SAMPLES=${samples} is smaller than SHARD_COUNT=${shard_count}; using SAMPLES=${shard_count}" >&2
+  samples=${shard_count}
 fi
 
 transition_token_args=()
@@ -71,12 +79,17 @@ fi
 if [[ "${ALLOW_NONFORMAL_BASELINE:-false}" == "true" ]]; then
   optional_args+=(--allow-nonformal-baseline)
 fi
+aggregate_args=()
+if [[ "${keep_shards}" == "true" ]]; then
+  aggregate_args+=(--keep-shards)
+fi
 
 mkdir -p "${out_dir}"
 echo "rollout multi eval dir: ${out_dir}" | tee -a "${out_dir}/output.log"
 echo "checkpoint: ${checkpoint_path}" | tee -a "${out_dir}/output.log"
 echo "GPU_IDS: ${gpu_ids}" | tee -a "${out_dir}/output.log"
 echo "SHARD_COUNT: ${shard_count}" | tee -a "${out_dir}/output.log"
+echo "ACTION_MODE: ${action_mode}" | tee -a "${out_dir}/output.log"
 
 pids=()
 shard_dirs=()
@@ -109,6 +122,8 @@ for ((shard_idx=0; shard_idx<shard_count; shard_idx++)); do
       --transition-token-hidden-mult "${transition_token_hidden_mult}" \
       --max-new-tokens "${max_new_tokens}" \
       --rollout-state "${rollout_state}" \
+      --action-mode "${action_mode}" \
+      --action-scale "${action_scale}" \
       --run-label "${run_label}" \
       "${transition_token_args[@]}" \
       "${optional_args[@]}" \
@@ -131,6 +146,7 @@ fi
 ../../.venv/bin/python aggregate_bair_rollout_shards.py \
   --out-dir "${out_dir}" \
   --shard-dirs "${shard_dirs[@]}" \
+  "${aggregate_args[@]}" \
   2>&1 | tee -a "${out_dir}/output.log"
 
 echo "rollout eval dir: ${out_dir}"

@@ -340,10 +340,12 @@ class BairRobotPushingConversation(Dataset):
         self.frames_key = bair_cfg.get("frames_key", "frames")
         self.actions_key = bair_cfg.get("actions_key", "actions")
         self.sample_mode = bair_cfg.get("sample_mode", "one_step")
+        self.task_mix = bair_cfg.get("task_mix", "world")
         self.min_dt = int(bair_cfg.get("min_dt", 1))
         self.max_dt = int(bair_cfg.get("max_dt", 1))
         self.max_shards = bair_cfg.get("max_shards")
         self.max_samples = bair_cfg.get("max_samples")
+        self._task_types = self._parse_task_mix(self.task_mix)
         self.with_transition_tokens = with_transition_tokens
         self.transition_token = reserved_token_from_id(transition_token_id)
         self.transition_token_count = int(transition_token_count)
@@ -358,7 +360,29 @@ class BairRobotPushingConversation(Dataset):
         self._cache = None
         self._build_index()
 
+    @staticmethod
+    def _parse_task_mix(task_mix):
+        task_mix = str(task_mix).strip().lower()
+        if task_mix in {"world", "world_only"}:
+            return ("world",)
+        if task_mix in {"action", "action_only", "inverse", "inverse_action"}:
+            return ("action",)
+        if task_mix in {"world_action", "action_world", "mixed", "awm"}:
+            return ("world", "action")
+        raise ValueError(
+            f"unknown BAIR task_mix: {task_mix}; expected world, action, or world_action"
+        )
+
+    @staticmethod
+    def unpack_ref(ref):
+        if len(ref) == 4:
+            file_idx, seq_idx, start, end = ref
+            return "world", file_idx, seq_idx, start, end
+        task_type, file_idx, seq_idx, start, end = ref
+        return task_type, file_idx, seq_idx, start, end
+
     def _build_index(self):
+        base_refs = []
         for file_idx, shard_path in enumerate(self.files):
             frames_shape = _npz_array_shape(shard_path, self.frames_key)
             actions_shape = _npz_array_shape(shard_path, self.actions_key)
@@ -369,19 +393,26 @@ class BairRobotPushingConversation(Dataset):
             if self.sample_mode == "one_step":
                 for seq_idx in range(num_sequences):
                     for start in range(max_start):
-                        self.data_list.append((file_idx, seq_idx, start, start + 1))
+                        base_refs.append((file_idx, seq_idx, start, start + 1))
             elif self.sample_mode == "direct_endpoint":
                 for seq_idx in range(num_sequences):
                     for start in range(max_start):
                         max_dt = min(self.max_dt, num_frames - 1 - start, num_actions - start)
                         for dt in range(self.min_dt, max_dt + 1):
-                            self.data_list.append((file_idx, seq_idx, start, start + dt))
+                            base_refs.append((file_idx, seq_idx, start, start + dt))
             else:
                 raise ValueError(f"unknown BAIR sample_mode: {self.sample_mode}")
 
+        for file_idx, seq_idx, start, end in base_refs:
+            for task_type in self._task_types:
+                self.data_list.append((task_type, file_idx, seq_idx, start, end))
+
         if self.max_samples is not None:
             self.data_list = self.data_list[: int(self.max_samples)]
-        logger.info(f"loaded {len(self.data_list)} BAIR world-model samples from {len(self.files)} shards")
+        logger.info(
+            f"loaded {len(self.data_list)} BAIR samples from {len(self.files)} shards "
+            f"(task_mix={self.task_mix}, tasks={self._task_types})"
+        )
 
     def transition_prompt(self):
         if not self.with_transition_tokens or self.transition_token_count <= 0:
@@ -417,7 +448,7 @@ class BairRobotPushingConversation(Dataset):
         return len(self.data_list)
 
     def __getitem__(self, idx):
-        file_idx, seq_idx, start, end = self.data_list[idx]
+        task_type, file_idx, seq_idx, start, end = self.unpack_ref(self.data_list[idx])
         shard = self._load_shard(file_idx)
         frames = shard[self.frames_key][seq_idx]
         actions = shard[self.actions_key][seq_idx]
@@ -426,19 +457,36 @@ class BairRobotPushingConversation(Dataset):
         image_j = self._frame_to_image(frames[end])
         action = actions[start:end].sum(axis=0).astype(np.float32)
 
-        conversations = [
-            {
-                "from": "human",
-                "value": "Generate the next image based on the current image and action."
-                + "<|image|><|action|>"
-                + self.transition_prompt(),
-            },
-            {
-                "from": "gpt",
-                "value": "<|image|>",
-            },
-        ]
-        return conversations, [image_i, image_j], [action], []
+        if task_type == "world":
+            conversations = [
+                {
+                    "from": "human",
+                    "value": "Generate the next image based on the current image and action."
+                    + "<|image|><|action|>"
+                    + self.transition_prompt(),
+                },
+                {
+                    "from": "gpt",
+                    "value": "<|image|>",
+                },
+            ]
+            return conversations, [image_i, image_j], [action], []
+
+        if task_type == "action":
+            conversations = [
+                {
+                    "from": "human",
+                    "value": "What action caused the transition between these two images?"
+                    + "<|image|><|image|>",
+                },
+                {
+                    "from": "gpt",
+                    "value": "<|action|>",
+                },
+            ]
+            return conversations, [image_i, image_j], [action], []
+
+        raise ValueError(f"unknown BAIR task type: {task_type}")
 
 if __name__=='__main__':
     data = LiberoFinetuneConversation('/mnt/damorobot/yuanyq/code/WorldVLA-main/worldvla/configs/libero_256_all/debug.yaml', 256, True)

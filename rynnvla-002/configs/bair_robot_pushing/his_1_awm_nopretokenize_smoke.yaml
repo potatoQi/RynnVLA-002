@@ -1,0 +1,12 @@
+META:
+  split: train_smoke
+  raw_data_dir: '../../../../data/bair_robot_pushing_npz/train'
+bair:
+  frames_key: frames
+  actions_key: actions
+  sample_mode: one_step
+  task_mix: world_action
+  min_dt: 1
+  max_dt: 1
+  max_shards: 1
+  max_samples: 32

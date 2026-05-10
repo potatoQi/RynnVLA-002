@@ -31,6 +31,8 @@ rollout_state=${ROLLOUT_STATE:-token}
 run_label=${RUN_LABEL:-$exp_name}
 max_shards=${MAX_SHARDS:-0}
 force_image_prefix=${FORCE_IMAGE_PREFIX:-true}
+action_mode=${ACTION_MODE:-gt}
+action_scale=${ACTION_SCALE:-1.0}
 
 transition_token_args=()
 if [[ "${with_transition_tokens}" == "true" ]]; then
@@ -81,6 +83,8 @@ mkdir -p "${out_dir}"
   --transition-token-hidden-mult "${transition_token_hidden_mult}" \
   --max-new-tokens "${max_new_tokens}" \
   --rollout-state "${rollout_state}" \
+  --action-mode "${action_mode}" \
+  --action-scale "${action_scale}" \
   --run-label "${run_label}" \
   "${transition_token_args[@]}" \
   "${optional_args[@]}" \

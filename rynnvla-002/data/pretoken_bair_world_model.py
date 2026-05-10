@@ -123,19 +123,33 @@ def _process_images_batched(item_processor: FlexARItemProcessor_Action, images: 
     return result
 
 
-def _bair_conversations(dataset: BairRobotPushingConversation) -> list[dict]:
-    return [
-        {
-            "from": "human",
-            "value": "Generate the next image based on the current image and action."
-            + "<|image|><|action|>"
-            + dataset.transition_prompt(),
-        },
-        {
-            "from": "gpt",
-            "value": "<|image|>",
-        },
-    ]
+def _bair_conversations(dataset: BairRobotPushingConversation, task_type: str) -> list[dict]:
+    if task_type == "world":
+        return [
+            {
+                "from": "human",
+                "value": "Generate the next image based on the current image and action."
+                + "<|image|><|action|>"
+                + dataset.transition_prompt(),
+            },
+            {
+                "from": "gpt",
+                "value": "<|image|>",
+            },
+        ]
+    if task_type == "action":
+        return [
+            {
+                "from": "human",
+                "value": "What action caused the transition between these two images?"
+                + "<|image|><|image|>",
+            },
+            {
+                "from": "gpt",
+                "value": "<|action|>",
+            },
+        ]
+    raise ValueError(f"unknown BAIR task type: {task_type}")
 
 
 def _build_flatten_template(item_processor: FlexARItemProcessor_Action, conversations: list[dict]):
@@ -210,11 +224,14 @@ def _pretokenize_rank(args: argparse.Namespace) -> None:
         target_size=args.target_size,
         tokenizer=args.tokenizer,
     )
-    template_tokens, template_labels = _build_flatten_template(item_processor, _bair_conversations(dataset))
+    templates = {
+        task_type: _build_flatten_template(item_processor, _bair_conversations(dataset, task_type))
+        for task_type in ("world", "action")
+    }
     image_cache = {}
 
     def make_item(idx: int):
-        file_idx, seq_idx, start, end = dataset.data_list[idx]
+        task_type, file_idx, seq_idx, start, end = dataset.unpack_ref(dataset.data_list[idx])
         shard = dataset._load_shard(file_idx)
         frames = shard[dataset.frames_key][seq_idx]
         actions = shard[dataset.actions_key][seq_idx]
@@ -224,12 +241,12 @@ def _pretokenize_rank(args: argparse.Namespace) -> None:
         image_i._bair_cache_key = (file_idx, seq_idx, start)
         image_j._bair_cache_key = (file_idx, seq_idx, end)
         action = actions[start:end].sum(axis=0).astype(np.float32)
-        return [image_i, image_j], [action]
+        return task_type, [image_i, image_j], [action]
 
     def prime_image_cache(current_idx: int) -> None:
         if args.image_batch_size <= 1:
             return
-        file_idx, seq_idx, start, frame_end = dataset.data_list[current_idx]
+        _, file_idx, seq_idx, start, frame_end = dataset.unpack_ref(dataset.data_list[current_idx])
         current_keys = ((file_idx, seq_idx, start), (file_idx, seq_idx, frame_end))
         if all(key in image_cache for key in current_keys):
             return
@@ -239,7 +256,7 @@ def _pretokenize_rank(args: argparse.Namespace) -> None:
         seen = set()
         pos = current_idx
         while pos < end and len(images) < args.image_batch_size:
-            file_idx, seq_idx, start, frame_end = dataset.data_list[pos]
+            _, file_idx, seq_idx, start, frame_end = dataset.unpack_ref(dataset.data_list[pos])
             shard = dataset._load_shard(file_idx)
             frames = shard[dataset.frames_key][seq_idx]
             for frame_idx in (start, frame_end):
@@ -350,9 +367,10 @@ def _pretokenize_rank(args: argparse.Namespace) -> None:
 
         try:
             prime_image_cache(idx)
-            images, actions = make_item(idx)
+            task_type, images, actions = make_item(idx)
             image_media = [cached_process_image(image) for image in images]
             action_media = [item_processor.process_action(action) for action in actions]
+            template_tokens, template_labels = templates[task_type]
             tokens, labels = _flatten_from_template(
                 item_processor,
                 template_tokens,
@@ -367,14 +385,14 @@ def _pretokenize_rank(args: argparse.Namespace) -> None:
                 pkl_path = (files_dir / f"{idx}.pkl").resolve()
                 with pkl_path.open("wb") as f:
                     pickle.dump({"token": tokens, "label": labels, "id": idx}, f)
-                record = {"file": str(pkl_path), "len": len(tokens), "id": idx}
+                record = {"file": str(pkl_path), "len": len(tokens), "id": idx, "task_type": task_type}
                 with record_path.open("a") as f:
                     f.write(json.dumps(record) + "\n")
             else:
                 token_buffer.append(tokens)
                 label_buffer.append(labels)
                 id_buffer.append(idx)
-                record_buffer.append({"len": len(tokens), "id": idx})
+                record_buffer.append({"len": len(tokens), "id": idx, "task_type": task_type})
                 if len(token_buffer) >= args.shard_size:
                     flush_shard()
             done_ids.add(idx)

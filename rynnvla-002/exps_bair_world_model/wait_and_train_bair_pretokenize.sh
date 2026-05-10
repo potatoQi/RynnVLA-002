@@ -6,6 +6,7 @@ cd "$script_dir"
 
 train_record=${TRAIN_RECORD:-../processed_data/bair_robot_pushing_tokens/his_1_world_model_train/record.json}
 test_record=${TEST_RECORD:-../processed_data/bair_robot_pushing_tokens/his_1_world_model_test/record.json}
+train_script=${TRAIN_SCRIPT:-train_bair_world_model_from_official_awm_pretokenize.sh}
 poll_seconds=${POLL_SECONDS:-60}
 
 echo "Waiting for BAIR pretokenized records:"
@@ -28,4 +29,4 @@ while [[ ! -s "$train_record" || ! -s "$test_record" ]]; do
 done
 
 echo "Pretokenized records are ready; starting training."
-exec bash "$script_dir/train_bair_world_model_from_official_awm_pretokenize.sh" "$@"
+exec bash "$script_dir/$train_script" "$@"

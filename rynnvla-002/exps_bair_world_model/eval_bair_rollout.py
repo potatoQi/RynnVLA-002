@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -76,9 +77,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-loss-weight", type=float, default=1e-5)
     parser.add_argument("--max-new-tokens", type=int, default=0)
     parser.add_argument("--rollout-state", choices=["token", "image"], default="token")
+    parser.add_argument("--use-cache", action="store_true", default=True)
+    parser.add_argument("--no-use-cache", action="store_false", dest="use_cache")
     parser.add_argument("--eos-token-ids", type=str, default="8196,8710")
     parser.add_argument("--force-image-prefix", action="store_true", default=True)
     parser.add_argument("--no-force-image-prefix", action="store_false", dest="force_image_prefix")
+    parser.add_argument(
+        "--action-mode",
+        choices=["gt", "zero", "shuffle", "negate_xy", "scale_xy"],
+        default="gt",
+        help="Action perturbation for action-sensitivity diagnostics. Default keeps ground-truth actions.",
+    )
+    parser.add_argument("--action-scale", type=float, default=1.0)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
@@ -231,6 +241,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Modul
             )
     if hasattr(model.model, "vqmodel"):
         del model.model.vqmodel
+    model.config.use_cache = bool(args.use_cache)
     model.to(device)
     model.eval()
     return model
@@ -466,6 +477,38 @@ def iter_selected_sequences(
             actions = shard[actions_key]
             for sample_idx, seq_idx in refs_by_file[file_idx]:
                 yield sample_idx, frames[seq_idx], actions[seq_idx], shard_path, seq_idx
+
+
+def rollout_action_indices(
+    *,
+    action_start: int,
+    future_frames: int,
+    sample_idx: int,
+    seed: int,
+    action_mode: str,
+) -> list[int]:
+    indices = list(range(action_start, action_start + future_frames))
+    if action_mode != "shuffle":
+        return indices
+    rng = random.Random(seed * 100_003 + sample_idx)
+    shuffled = list(indices)
+    rng.shuffle(shuffled)
+    return shuffled
+
+
+def transform_action(action: np.ndarray, *, args: argparse.Namespace) -> np.ndarray:
+    out = np.asarray(action, dtype=np.float32).copy()
+    if args.action_mode in {"gt", "shuffle"}:
+        return out
+    if args.action_mode == "zero":
+        return np.zeros_like(out)
+    if args.action_mode == "negate_xy":
+        out[..., :2] *= -1.0
+        return out
+    if args.action_mode == "scale_xy":
+        out[..., :2] *= float(args.action_scale)
+        return out
+    raise ValueError(f"unsupported action_mode={args.action_mode}")
 
 
 def frame_to_pil(frame: np.ndarray, resolution: int) -> Image.Image:
@@ -732,6 +775,7 @@ def collect_rollouts(
         do_sample=args.do_sample,
         eos_token_id=eos_token_ids,
         pad_token_id=eos_token_ids[-1] if eos_token_ids else None,
+        use_cache=args.use_cache,
     )
 
     gt_by_idx: dict[int, torch.Tensor] = {}
@@ -751,13 +795,20 @@ def collect_rollouts(
         current_image = generated_images[-1]
         current_image_tokens = encode_image_tokens(current_image, item_processor) if args.rollout_state == "token" else []
         action_start = args.context_frames - 1
+        action_indices = rollout_action_indices(
+            action_start=action_start,
+            future_frames=args.future_frames,
+            sample_idx=sample_idx,
+            seed=args.seed,
+            action_mode=args.action_mode,
+        )
         failures = 0
         token_lengths: list[float] = []
         prompt_lengths: list[float] = []
         first_failure = ""
         first_failure_tokens = ""
         for step in range(args.future_frames):
-            action = actions[action_start + step]
+            action = transform_action(actions[action_indices[step]], args=args)
             if args.rollout_state == "token":
                 current_image_tokens, current_image, meta = generate_next_image_tokens(
                     model,
@@ -800,6 +851,8 @@ def collect_rollouts(
                 "mean_image_tokens": float(np.mean(token_lengths)) if token_lengths else 0.0,
                 "mean_prompt_tokens": float(np.mean(prompt_lengths)) if prompt_lengths else 0.0,
                 "rollout_state": args.rollout_state,
+                "action_mode": args.action_mode,
+                "action_scale": float(args.action_scale),
                 "first_failure": first_failure,
                 "first_failure_tokens": first_failure_tokens,
             }
@@ -927,6 +980,8 @@ def grouped_metrics(
             "transition_token_count": float(args.transition_token_count),
             "max_new_tokens": float(default_max_new_tokens(args)),
             "rollout_state": args.rollout_state,
+            "action_mode": args.action_mode,
+            "action_scale": float(args.action_scale),
             "force_image_prefix": bool(args.force_image_prefix),
             "do_sample": bool(args.do_sample),
             "temperature": float(args.temperature),
@@ -1013,6 +1068,8 @@ def partial_rollout_metrics(
             "with_transition_tokens": bool(args.with_transition_tokens),
             "transition_token_count": float(args.transition_token_count),
             "rollout_state": args.rollout_state,
+            "action_mode": args.action_mode,
+            "action_scale": float(args.action_scale),
             "force_image_prefix": bool(args.force_image_prefix),
         },
         "quality": quality,
@@ -1172,6 +1229,18 @@ def save_artifacts(
         )
         artifacts["rollout_gifs"] = [str(path) for path in gif_paths]
     save_json(out_dir / "rollout_artifacts.json", artifacts)
+    cleanup_partial_artifacts(out_dir)
+
+
+def cleanup_partial_artifacts(out_dir: Path) -> None:
+    for path in (
+        out_dir / "partial_metrics.json",
+        out_dir / "partial_sample_manifest.json",
+        out_dir / "partial_status.json",
+        out_dir / "partial_prediction_grid.png",
+    ):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(out_dir / "partial_rollout_videos", ignore_errors=True)
 
 
 def main() -> None:

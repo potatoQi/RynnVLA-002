@@ -466,22 +466,39 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
         if 'output_hidden_states' in kwargs:
             # c_loss, additional_loss_dict, logits, hidden_states, labels_c
             hidden_states = result[2][-1]  # [batch_size, seq_len, hidden_dim]
-            
-            # 调用ActionHead来预测动作
-            predicted_actions, actions_flag = self.action_head(
-                hidden_states=hidden_states,
-                input_ids=input_ids,
-                attention_mask=None,
-                target_token_id=10004
-            )
-
-            if actions_flag == False:
-                return c_loss, additional_loss_dict, result[1], hidden_states, labels, predicted_actions, predicted_actions.mean()*0
-            
-            # print(f"Predicted actions shape: {predicted_actions.shape}")
-            # print(f"Predicted actions: {predicted_actions}")
 
             labels_action_dis, sequences = self.get_action_hs_label(result[2][-1], labels)
+            # FSDP requires all ranks to enter wrapped modules in the same order.
+            # Mixed BAIR batches can contain no action targets on a rank, so use a
+            # zero-weight dummy action-head call instead of skipping the module.
+            has_action_targets = len(sequences) > 0
+            action_batch_size = len(sequences) if has_action_targets else 1
+            action_context_ids = input_ids.new_zeros((action_batch_size, input_ids.shape[1]))
+            action_context_hiddens = []
+            if has_action_targets:
+                for row_idx, (batch_idx, action_value_start) in enumerate(sequences):
+                    action_start_token_pos = max(int(action_value_start) - 1, 0)
+                    action_context_ids[row_idx, action_start_token_pos] = 10004
+                    action_context_hiddens.append(hidden_states[batch_idx])
+            else:
+                dummy_action_pos = 1 if input_ids.shape[1] > 1 else 0
+                action_context_ids[0, dummy_action_pos] = 10004
+                action_context_hiddens.append(hidden_states[0])
+            action_context_hiddens = torch.stack(action_context_hiddens, dim=0)
+
+            predicted_actions_all, _ = self.action_head(
+                hidden_states=action_context_hiddens,
+                input_ids=action_context_ids,
+                attention_mask=None,
+                target_token_id=10004,
+                eval=True,
+            )
+            if not has_action_targets:
+                loss_ct = predicted_actions_all.mean() * 0 + hidden_states.mean() * 0
+                predicted_actions = predicted_actions_all[:0]
+                return c_loss, additional_loss_dict, result[1], hidden_states, labels, predicted_actions, loss_ct
+
+            predicted_actions = predicted_actions_all
             labels_action_ct = self.decode_token_ids_to_actions(labels_action_dis)
 
             loss_ct = torch.nn.functional.l1_loss(predicted_actions, labels_action_ct)

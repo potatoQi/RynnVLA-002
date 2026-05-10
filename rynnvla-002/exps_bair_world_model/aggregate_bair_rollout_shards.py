@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Aggregate sharded BAIR rollout eval metrics.")
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--shard-dirs", nargs="+", required=True)
+    parser.add_argument("--keep-shards", action="store_true")
     return parser.parse_args()
 
 
@@ -80,41 +82,138 @@ def aggregate_per_horizon(shard_metrics: list[dict[str, Any]]) -> dict[str, dict
     return out
 
 
-def collect_artifacts(shard_dirs: list[Path]) -> dict[str, object]:
-    metric_paths = []
-    manifest_paths = []
+def save_contact_sheet(image_paths: list[Path], path: Path, *, max_cols: int = 2) -> bool:
+    if not image_paths:
+        return False
+    try:
+        from PIL import Image
+    except Exception:
+        shutil.copy2(image_paths[0], path)
+        return True
+
+    images = [Image.open(image_path).convert("RGB") for image_path in image_paths]
+    try:
+        cols = max(1, min(max_cols, len(images)))
+        rows = math.ceil(len(images) / cols)
+        cell_w = max(image.width for image in images)
+        cell_h = max(image.height for image in images)
+        sheet = Image.new("RGB", (cols * cell_w, rows * cell_h), "white")
+        for index, image in enumerate(images):
+            row, col = divmod(index, cols)
+            x = col * cell_w + (cell_w - image.width) // 2
+            y = row * cell_h + (cell_h - image.height) // 2
+            sheet.paste(image, (x, y))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sheet.save(path)
+        return True
+    finally:
+        for image in images:
+            image.close()
+
+
+def save_horizon_plot(metrics: dict[str, Any], path: Path) -> bool:
+    per_horizon = metrics.get("per_horizon", {})
+    if not isinstance(per_horizon, dict) or not per_horizon:
+        return False
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+
+    horizons = sorted((int(horizon), values) for horizon, values in per_horizon.items())
+    x = [horizon for horizon, _ in horizons]
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.2))
+    for axis, key, title in zip(
+        axes,
+        ("frame_mse", "frame_psnr", "frame_ssim"),
+        ("MSE", "PSNR", "SSIM"),
+        strict=True,
+    ):
+        y = [float(values.get(key, 0.0)) for _, values in horizons]
+        axis.plot(x, y, marker="o", linewidth=1.8)
+        axis.set_title(title)
+        axis.set_xlabel("horizon")
+        axis.grid(True, alpha=0.25)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return True
+
+
+def merge_artifacts(
+    out_dir: Path,
+    shard_dirs: list[Path],
+    metrics: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    keep_shards: bool,
+) -> dict[str, object]:
+    rollout_dir = out_dir / "rollout_videos"
+    shutil.rmtree(rollout_dir, ignore_errors=True)
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+
+    shard_metric_paths = []
+    shard_manifest_paths = []
+    merged_manifests = []
     gif_paths = []
-    grid_paths = []
-    horizon_paths = []
-    for shard_dir in shard_dirs:
+    grid_sources = []
+
+    gif_index = 0
+    for shard_index, shard_dir in enumerate(shard_dirs):
         for name in ("metrics.json", "sample_manifest.json"):
             path = shard_dir / name
             if path.exists():
                 if name == "metrics.json":
-                    metric_paths.append(str(path))
+                    shard_metric_paths.append(str(path))
                 else:
-                    manifest_paths.append(str(path))
+                    shard_manifest_paths.append(str(path))
+                    manifest = load_json(path)
+                    if isinstance(manifest, list):
+                        merged_manifests.extend(manifest)
         gif_dir = shard_dir / "rollout_videos"
         if gif_dir.exists():
-            gif_paths.extend(str(path) for path in sorted(gif_dir.glob("*.gif")))
+            for gif_path in sorted(gif_dir.glob("*.gif")):
+                merged_path = rollout_dir / f"rollout_clip_{gif_index:03d}.gif"
+                shutil.copy2(gif_path, merged_path)
+                gif_paths.append(str(merged_path))
+                gif_index += 1
         grid = shard_dir / "prediction_grid.png"
         if grid.exists():
-            grid_paths.append(str(grid))
-        horizon = shard_dir / "horizon_metrics.png"
-        if horizon.exists():
-            horizon_paths.append(str(horizon))
-    return {
-        "shard_metrics": metric_paths,
-        "shard_manifests": manifest_paths,
+            grid_sources.append(grid)
+
+    prediction_grid = out_dir / "prediction_grid.png"
+    if not save_contact_sheet(grid_sources, prediction_grid):
+        prediction_grid.unlink(missing_ok=True)
+
+    horizon_metrics = out_dir / "horizon_metrics.png"
+    if not save_horizon_plot(metrics, horizon_metrics):
+        horizon_metrics.unlink(missing_ok=True)
+
+    if merged_manifests:
+        save_json(out_dir / "sample_manifest.json", merged_manifests)
+    save_json(out_dir / "run_config.json", config)
+
+    artifacts: dict[str, object] = {
+        "prediction_grid": str(prediction_grid) if prediction_grid.exists() else "",
+        "horizon_metrics": str(horizon_metrics) if horizon_metrics.exists() else "",
         "rollout_gifs": gif_paths,
-        "prediction_grids": grid_paths,
-        "horizon_metrics": horizon_paths,
     }
+    if keep_shards:
+        artifacts["shard_metrics"] = shard_metric_paths
+        artifacts["shard_manifests"] = shard_manifest_paths
+    else:
+        for shard_dir in shard_dirs:
+            shutil.rmtree(shard_dir, ignore_errors=True)
+    return artifacts
 
 
 def main() -> None:
     args = parse_args()
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir).resolve()
     shard_dirs = [Path(path) for path in args.shard_dirs]
     shard_metrics = [load_json(shard_dir / "metrics.json") for shard_dir in shard_dirs]
     first = shard_metrics[0]
@@ -147,7 +246,10 @@ def main() -> None:
         "diagnostics": first.get("diagnostics", {}),
     }
     save_json(out_dir / "metrics.json", metrics)
-    save_json(out_dir / "rollout_artifacts.json", collect_artifacts(shard_dirs))
+    save_json(
+        out_dir / "rollout_artifacts.json",
+        merge_artifacts(out_dir, shard_dirs, metrics, config, keep_shards=args.keep_shards),
+    )
     print(f"[aggregate] wrote {out_dir}")
 
 

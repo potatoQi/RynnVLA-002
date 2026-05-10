@@ -24,6 +24,7 @@ lr=${LR:-5e-6}
 wd=${WEIGHT_DECAY:-0.1}
 dropout=${DROPOUT:-0.05}
 z_loss_weight=${Z_LOSS_WEIGHT:-1e-5}
+loss_ct_weights=${LOSS_CT_WEIGHTS:-10}
 precision=${PRECISION:-tf32}
 data_parallel=${DATA_PARALLEL:-fsdp}
 preprocess=${PREPROCESS:-false}
@@ -191,6 +192,7 @@ mkdir -p "$output_dir"/"$exp_name"
   --unmask_image_logits \
   --dropout ${dropout} \
   --z_loss_weight ${z_loss_weight} \
+  --loss_ct_weights ${loss_ct_weights} \
   --ckpt_max_keep ${ckpt_max_keep} \
   --best_checkpoint_metric "${best_checkpoint_metric}" \
   --best_checkpoint_split "${best_checkpoint_split}" \

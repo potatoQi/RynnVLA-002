@@ -528,6 +528,14 @@ class PretrainSolverBase_ck_action_head(ABC):
                 return
 
             env = os.environ.copy()
+            rollout_samples = max(int(self.args.rollout_eval_samples), int(self.args.rollout_eval_num_gpus))
+            if rollout_samples != self.args.rollout_eval_samples:
+                self.logger.info(
+                    "increase rollout eval samples from %s to %s to cover %s GPU shard(s)",
+                    self.args.rollout_eval_samples,
+                    rollout_samples,
+                    self.args.rollout_eval_num_gpus,
+                )
             env.update(
                 {
                     "CHECKPOINT_PATH": checkpoint_path,
@@ -535,7 +543,7 @@ class PretrainSolverBase_ck_action_head(ABC):
                     "EXP_NAME": eval_name,
                     "RUN_LABEL": eval_name,
                     "WITH_TRANSITION_TOKENS": str(bool(self.args.with_transition_tokens)).lower(),
-                    "SAMPLES": str(self.args.rollout_eval_samples),
+                    "SAMPLES": str(rollout_samples),
                     "FUTURE_FRAMES": str(self.args.rollout_eval_future_frames),
                     "PREVIEW_SAMPLES": str(self.args.rollout_eval_preview_samples),
                     "SAVE_GIF": "true",
